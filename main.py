@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import yaml
 import os
@@ -126,6 +127,8 @@ class UnsupervisedObjectDetectionModel(nn.Module):
 def train_model(model, dataloader, optimizer, device, epochs, final_batch_size, mini_batch_size, rank, world_size):
     model.train()
     accumulation_steps = final_batch_size // mini_batch_size
+    print(f"Mini-batch size (before gradient accumulation): {mini_batch_size}")
+    print(f"Final batch size (after gradient accumulation): {final_batch_size}")
     for epoch in range(epochs):
         running_loss = 0.0
         optimizer.zero_grad()  # Initialize gradients to zero at the start of each epoch
@@ -165,6 +168,7 @@ def train_model(model, dataloader, optimizer, device, epochs, final_batch_size, 
 # Main function for distributed training
 def main():
     config = load_config('config.yaml')
+    print(config['batch_size'])
 
     # Get the distributed configuration from environment variables or set defaults for single GPU
     rank = int(os.environ.get('RANK', 0))

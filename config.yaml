@@ -1,8 +1,10 @@
 batch_size: 4           # mini-batch size (per gradient accumulation step)
 final_batch_size: 16     # total effective batch size after gradient accumulation
-epochs: 20
+epochs: 2
 lr: 0.0001
 data_dir: "/media/ck/data/coco"
 num_workers: 4
 device: "cuda"
+data_percentage: 0.01  # Use 1% of the dataset
+
 
