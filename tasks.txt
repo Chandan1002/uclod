@@ -3,7 +3,12 @@ To Do:
   - Multiple Datasets
   - Augmentations
   - Crop
+  - Use correct data partitioning for 1%, 2% etc(Already existing method??)
 
 2: Main
   - Check the correct loading of images.
-  - 
+  - Verify Gradient Accumulation
+  -
+
+3: Writing
+  - Corloc Scores
