@@ -1,0 +1,9 @@
+To Do:
+1: Dataloader
+  - Multiple Datasets
+  - Augmentations
+  - Crop
+
+2: Main
+  - Check the correct loading of images.
+  - 
