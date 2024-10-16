@@ -1,0 +1,9 @@
+dataset: coco  # Options: 'coco', 'pascal_voc'
+data_dir: /path/to/your/dataset  # Update with the path to your dataset
+batch_size: 8
+num_workers: 4
+lr: 0.001
+max_iter: 10000
+detectron2_cfg_file: /path/to/detectron2/config.yaml  # Update with the path to your Detectron2 config
+pretrained_weights: detectron2://ImageNetPretrained/MSRA/R-50.pkl  # Update with the appropriate path or Detectron2 model zoo URL
+accumulation_steps: 4
