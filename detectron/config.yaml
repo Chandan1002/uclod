@@ -1,5 +1,5 @@
 dataset: coco  # Options: 'coco', 'pascal_voc'
-data_dir: /path/to/your/dataset  # Update with the path to your dataset
+data_dir: "/media/ck/data/coco"  # Update with the path to your dataset
 batch_size: 8
 num_workers: 4
 lr: 0.001
