@@ -1,15 +1,22 @@
+import detectron2
+from detectron2.engine import DefaultTrainer, default_setup
+from detectron2.config import get_cfg
+from detectron2.data import DatasetCatalog, MetadataCatalog
+from detectron2.data.datasets import register_coco_instances, register_pascal_voc
+from detectron2.utils.logger import setup_logger
+from torchvision import models
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-import yaml
 import os
-import torchvision.transforms as transforms
+import yaml
 
 # Import the dataloader from the new dataloader.py file
-from dataloader import get_coco_dataloader
-from torchvision import models
+from dataloader import get_coco_dataloader, get_pascal_voc_dataloader
+
+# Set up the logger
+setup_logger()
+
+print("Printing from detectron folder")
 
 # Function to load configuration from YAML file
 def load_config(config_file):
@@ -17,21 +24,37 @@ def load_config(config_file):
         config = yaml.safe_load(file)
     return config
 
-# Initialize distributed process group
-def setup_distributed(rank, world_size):
-    if world_size > 1:
-        dist.init_process_group(
-            backend='nccl',  # Use NCCL backend for GPU training
-            init_method='env://',  # Read environment variables for initialization
-            rank=rank,
-            world_size=world_size
-        )
+# Custom trainer with gradient accumulation
+class GradientAccumulationTrainer(DefaultTrainer):
+    def __init__(self, cfg, accumulation_steps):
+        super().__init__(cfg)
+        self.accumulation_steps = accumulation_steps
+        self.grad_step = 0
+        self._data_loader_iter = iter(self.data_loader)
+        self.grad_scaler = torch.cuda.amp.GradScaler()  # Initialize gradient scaler for mixed precision
 
-# Cleanup distributed process group
-def cleanup_distributed():
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    def run_step(self):
+        assert self.model.training, "Model is not in training mode!"
 
+        try:
+            data = next(self._data_loader_iter)
+        except StopIteration:
+            self._data_loader_iter = iter(self.data_loader)
+            data = next(self._data_loader_iter)
+        
+        with torch.amp.autocast('cuda'):  # Enable mixed precision
+            loss_dict = self.model(data)
+            losses = sum(loss_dict.values())
+            losses /= self.accumulation_steps
+
+        self.grad_scaler.scale(losses).backward()
+
+        # Accumulate gradients and update the optimizer every accumulation_steps
+        self.grad_step += 1
+        if self.grad_step % self.accumulation_steps == 0:
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+            self.optimizer.zero_grad()
 
 # Define ResNet-50 Backbone
 class ResNetBackbone(nn.Module):
@@ -43,15 +66,22 @@ class ResNetBackbone(nn.Module):
     def forward(self, x):
         return self.resnet(x)
 
-# Define RetinaNet Backbone using ResNet-50
+# Define RetinaNet Backbone
 class RetinaNetBackbone(nn.Module):
     def __init__(self):
         super(RetinaNetBackbone, self).__init__()
-        self.retinanet = models.resnet50(pretrained=True)
-        self.retinanet.fc = nn.Identity()  # Remove final classification layer
+        # Using Detectron2 model zoo to load RetinaNet backbone
+        from detectron2.model_zoo import get_config
+        from detectron2.modeling import build_model
+
+        cfg = get_cfg()
+        cfg.merge_from_file("/media/ck/Project1TB/clod/detectron/detectron2/configs/COCO-Detection/retinanet_R_50_FPN_1x.yaml")
+        cfg.MODEL.WEIGHTS = "detectron2://COCO-Detection/retinanet_R_50_FPN_1x/137849486/model_final.pth"
+        self.retinanet = build_model(cfg)
+        self.retinanet.eval()
 
     def forward(self, x):
-        return self.retinanet(x)
+        return self.retinanet.backbone(x)
 
 # Define projection head
 class ProjectionHead(nn.Module):
@@ -91,12 +121,10 @@ class NTXentLossWithAnchor(nn.Module):
         loss = nn.CrossEntropyLoss()(logits, labels)
         return loss
 
-
-
-# Define the main Unsupervised Object Detection model
-class UnsupervisedObjectDetectionModel(nn.Module):
+# Define the main Contrastive Learning Model
+class ContrastiveLearningModel(nn.Module):
     def __init__(self):
-        super(UnsupervisedObjectDetectionModel, self).__init__()
+        super(ContrastiveLearningModel, self).__init__()
         self.resnet_backbone = ResNetBackbone()
         self.retinanet_backbone = RetinaNetBackbone()
         self.projection_head = ProjectionHead(input_dim=2048)  # ResNet-50 has 2048 features
@@ -107,9 +135,17 @@ class UnsupervisedObjectDetectionModel(nn.Module):
         ri = self.resnet_backbone(xi)
         zi = self.projection_head(ri)
 
-        # Pipeline 2: Process full image xj through ResNet-50 as RetinaNet Backbone
+        # Pipeline 2: Process full image xj through RetinaNet Backbone
         rj = self.retinanet_backbone(xj)
         zj = self.projection_head(rj)
+
+        # Process negatives: extract features from the negatives
+        negative_features = []
+        for negative in negatives:
+            r_neg = self.resnet_backbone(negative)
+            z_neg = self.projection_head(r_neg)
+            negative_features.append(z_neg)
+        anchor_negative = torch.stack(negative_features)
 
         # Process negatives: extract features from the negatives
         negative_features = []
@@ -123,89 +159,39 @@ class UnsupervisedObjectDetectionModel(nn.Module):
         loss = self.loss_fn(zi, zj, anchor_negative)
         return loss
 
-# Training function with Distributed Data Parallel and Gradient Accumulation
-def train_model(model, dataloader, optimizer, device, epochs, final_batch_size, mini_batch_size, rank, world_size):
-    model.train()
-    accumulation_steps = final_batch_size // mini_batch_size
-    print(f"Mini-batch size (before gradient accumulation): {mini_batch_size}")
-    print(f"Final batch size (after gradient accumulation): {final_batch_size}")
-    for epoch in range(epochs):
-        running_loss = 0.0
-        optimizer.zero_grad()  # Initialize gradients to zero at the start of each epoch
-        for i, (images, targets) in enumerate(dataloader):
-            # Stack images into a batch and move them to the device
-            images = torch.stack(images).to(device)
-
-            # Use images directly (augmentations are already applied in the DataLoader)
-            xi = images
-            xj = images
-
-            # Generate negatives (random other images or cropped locations)
-            negatives = torch.stack([images for _ in range(10)], dim=0)
-
-            # Compute the loss
-            loss = model(xi, xj, negatives)
-            loss = loss / accumulation_steps  # Scale the loss by accumulation steps
-
-            # Backpropagation
-            loss.backward()
-
-            # Accumulate gradients and update the optimizer every accumulation_steps
-            if (i + 1) % accumulation_steps == 0:
-                optimizer.step()  # Update the model parameters
-                optimizer.zero_grad()  # Reset gradients to zero after updating
-
-            running_loss += loss.item() * accumulation_steps
-
-            if (i + 1) % (accumulation_steps * 10) == 0:  # Print loss every 10 accumulated steps
-                print(f"Epoch [{epoch+1}/{epochs}], Step [{i+1}/{len(dataloader)}], Loss: {running_loss/(i+1):.4f}")
-
-        # Update the sampler for distributed training (if any)
-        if world_size > 1:
-            dataloader.sampler.set_epoch(epoch)
-
-
-# Main function for distributed training
+# Main function to set up the Detectron2 configuration and start training
 def main():
     config = load_config('config.yaml')
     print(config['batch_size'])
 
-    # Get the distributed configuration from environment variables or set defaults for single GPU
-    rank = int(os.environ.get('RANK', 0))
-    world_size = int(os.environ.get('WORLD_SIZE', 1))
-    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    # Load dataset based on config setting
+    if config['dataset'] == 'coco':
+        train_loader = get_coco_dataloader(config['data_dir'], config['batch_size'], config['num_workers'])
+    elif config['dataset'] == 'pascal_voc':
+        train_loader = get_pascal_voc_dataloader(config['data_dir'], config['batch_size'], config['num_workers'])
+    else:
+        raise ValueError("Unsupported dataset. Please choose either 'coco' or 'pascal_voc'.")
+    
+    # Set up the Detectron2 configuration
+    cfg = get_cfg()
+    cfg.merge_from_file(config['detectron2_cfg_file'])
+    cfg.DATASETS.TRAIN = ("coco_train",) if config['dataset'] == 'coco' else ("voc_train",)
+    cfg.SOLVER.IMS_PER_BATCH = config['batch_size']
+    cfg.SOLVER.BASE_LR = config['lr']
+    cfg.SOLVER.MAX_ITER = config['max_iter']
+    cfg.MODEL.WEIGHTS = config['pretrained_weights']  # Path to pretrained weights (if any)
 
-    # Set up the distributed process group if needed
-    setup_distributed(rank, world_size)
-
-    # Set the device based on the local rank (for multi-GPU per node)
-    device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
-
-    # Load COCO dataset
-    train_loader, train_sampler = get_coco_dataloader(config['data_dir'], config['batch_size'], config['num_workers'], rank, world_size)
+    # Create output directory if it doesn't exist
+    os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
 
     # Initialize model
-    model = UnsupervisedObjectDetectionModel().to(device)
+    model = ContrastiveLearningModel()
 
-    # Wrap the model with Distributed Data Parallel (DDP) only for multi-GPU setup
-    if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-
-    # Initialize optimizer
-    optimizer = optim.Adam(model.parameters(), lr=config['lr'])
-
-    # Start training with gradient accumulation
-    train_model(
-        model, train_loader, optimizer, device, 
-        epochs=config['epochs'], 
-        final_batch_size=config['final_batch_size'], 
-        mini_batch_size=config['batch_size'], 
-        rank=rank, world_size=world_size
-    )
-
-    # Clean up the distributed process group if needed
-    cleanup_distributed()
+    # Set up the custom trainer with gradient accumulation and start training
+    accumulation_steps = config.get('accumulation_steps', 1)
+    trainer = GradientAccumulationTrainer(cfg, accumulation_steps=accumulation_steps)
+    trainer.resume_or_load(resume=False)
+    trainer.train()
 
 if __name__ == "__main__":
     main()  # <-- Ensure the main function is called
-
