@@ -1,0 +1,161 @@
+# =============================================================================
+# Main Configuration for Unsupervised Object Detection Training
+# =============================================================================
+
+# Dataset Configuration
+# -----------------------------------------------------------------------------
+dataset:
+  name: "coco"
+  data_dir: "/home/data/ecx/coco"
+  batch_size: 16
+  num_workers: 4
+
+# Training Configuration
+# -----------------------------------------------------------------------------
+training:
+  epochs: 10
+  max_iter: 1000
+  seed: 42
+  accumulation_steps: 4
+  
+  # Optimization settings
+  optimizer:
+    lr: 0.001
+    min_lr: 0.00001
+    weight_decay: 0.0001
+    grad_clip: 1.0
+  
+  # Learning rate scheduler
+  scheduler:
+    type: "cosine"
+    T0: 10
+    T_mult: 2
+    warmup_epochs: 5
+
+# Model Configuration
+# -----------------------------------------------------------------------------
+model:
+  # Core model parameters
+  temperature: 0.5
+  backbone_name: "resnet50"  # Options: resnet18, resnet34, resnet50, resnet101, resnet152
+  fpn_channels: 256
+  projection_dim: 128
+  pretrained: true
+  
+  # Mixed precision training
+  mixed_precision:
+    enabled: true
+    initial_scale_power: 32
+    growth_factor: 2
+    backoff_factor: 0.5
+    growth_interval: 2000
+
+# Hardware and Infrastructure
+# -----------------------------------------------------------------------------
+infrastructure:
+  # Hardware settings
+  hardware:
+    num_gpus: 1
+    use_gpu: true
+    precision: 16
+    cudnn_benchmark: true
+    deterministic: false
+  
+  # Distributed training
+  distributed:
+    enabled: false
+    master_addr: "localhost"
+    master_port: 29500
+    dist_backend: "nccl"
+
+# Logging and Monitoring
+# -----------------------------------------------------------------------------
+monitoring:
+  # Logging configuration
+  logging:
+    save_dir: "checkpoints"
+    log_dir: "runs"
+    checkpoint_interval: 1000
+    log_interval: 10
+    eval_interval: 100
+    save_optimizer: true
+    save_best: true
+    num_kept_checkpoints: 5
+  
+  # Visualization settings
+  visualization:
+    enabled: true
+    save_heatmaps: true
+    save_fpn_features: true
+    save_grid_accuracy: true
+    plot_frequency: 100
+    max_images_per_batch: 4
+    output_size: [800, 800]
+    colormap: "viridis"
+  
+  # Debug settings
+  debug:
+    enabled: false
+    detect_anomaly: false
+    profile_cuda: false
+    profile_cpu: false
+    verbose: false
+
+# Hyperparameter Optimization
+# -----------------------------------------------------------------------------
+hpo:
+  enabled: false  # Enable only when running HPO
+  backend: "optuna"
+  num_trials: 100
+  timeout: 172800  # 48 hours in seconds
+  
+  # Search space definition
+  search_space:
+    lr:
+      min: 0.0001
+      max: 0.1
+      scale: "log"
+    batch_size:
+      values: [16, 32, 64, 128]
+    temperature:
+      min: 0.1
+      max: 1.0
+      scale: "linear"
+    weight_decay:
+      min: 0.00001
+      max: 0.001
+      scale: "log"
+    fpn_channels:
+      values: [128, 256, 512]
+    projection_dim:
+      values: [64, 128, 256]
+  
+  # Early stopping criteria
+  early_stopping:
+    patience: 5
+    min_delta: 0.01
+
+# Data Augmentation Pipeline
+# -----------------------------------------------------------------------------
+augmentation:
+  enabled: true
+  crop_size: 224  # Size for both random crops and final image size
+  min_crop_scale: 0.08
+  max_crop_scale: 0.25
+  
+  # Color augmentations
+  color_jitter:
+    brightness: 0.4
+    contrast: 0.4
+    saturation: 0.4
+    hue: 0.1
+  
+  # Other augmentations
+  flip_prob: 0.5
+  blur_probability: 0.5
+  grayscale_probability: 0.2
+  
+  # Normalization
+  normalize:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
