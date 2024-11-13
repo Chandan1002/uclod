@@ -1,0 +1,57 @@
+# System Configuration
+SYSTEM:
+  NUM_GPUS: 2  # Set to 2 or 4 for multi-GPU training
+  NUM_WORKERS: 4
+  DEVICE: "cuda"
+  DEBUG_MODE: False
+  SEED: 42
+
+# Distributed Training
+DISTRIBUTED:
+  ENABLED: True  # Must be True for multi-GPU
+  BACKEND: "nccl"  # Use nccl for GPU training
+  WORLD_SIZE: 2  # Should match NUM_GPUS
+  MASTER_ADDR: "localhost"
+  MASTER_PORT: "12355"
+
+# Dataset Configuration
+DATASETS:
+  PERCENTAGE: 10
+  ROOT: "/nfs/data/gist/ecx/coco"
+
+# Model Configuration
+MODEL:
+  META_ARCHITECTURE: "UnsupervisedRCNN"
+  WEIGHTS: ""
+  PIXEL_MEAN: [0.485, 0.456, 0.406]  # ImageNet normalize values
+  PIXEL_STD: [0.229, 0.224, 0.225]
+  BACKBONE:
+    NAME: "resnet50"
+    FREEZE_AT: 2
+  PROJECTION:
+    DIM: 128
+    TEMPERATURE: 0.07
+
+# Input Configuration
+INPUT:
+  FORMAT: "RGB"
+  CROP:
+    ENABLED: True
+    SIZE: [0.1, 0.25]  # Range for random crop size as percentage
+
+# Solver Configuration
+SOLVER:
+  IMS_PER_BATCH: 2  # Per GPU batch size
+  BASE_LR: 0.0001
+  WEIGHT_DECAY: 0.0001
+  MAX_ITER: 10
+  WARMUP_ITERS: 1
+  STEPS: (70000, 90000)
+  CHECKPOINT_PERIOD: 1
+  OPTIMIZER: "ADAM"
+
+# Output Configuration
+OUTPUT:
+  DIR: "./output"
+  SAVE_PERIOD: 5000
+  LOG_PERIOD: 100
