@@ -5,6 +5,22 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from datetime import datetime
+from main import setup_logger, train
+import logging
+
+logger = logging.getLogger(__name__)
+
+def save_metrics(output_dir, metrics):
+    """Save training metrics to a JSON file"""
+    metrics_path = os.path.join(output_dir, 'metrics.json')
+    with open(metrics_path, 'w') as f:
+        json.dump({
+            'accuracy': metrics['SGA'],    # Similarity Grid Accuracy
+            'riga': metrics['RIGA'],       # Random Initialization Grid Accuracy
+            'gap_r': metrics['GAP-R'],     # Grid Alignment Performance Ratio
+            'loss': metrics.get('final_loss', None),
+            'timestamp': datetime.now().isoformat()
+        }, f, indent=2)
 
 def load_config(config_file):
     """Load YAML configuration file"""
@@ -12,7 +28,12 @@ def load_config(config_file):
         return yaml.safe_load(f)
 
 def setup_distributed_training(rank, world_size, config):
+    # Set device first
+    torch.cuda.set_device(rank)
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(rank)
+
     """Setup for distributed training"""
+    # Then set environment variables
     os.environ['MASTER_ADDR'] = config['DISTRIBUTED']['MASTER_ADDR']
     os.environ['MASTER_PORT'] = config['DISTRIBUTED']['MASTER_PORT']
     os.environ['WORLD_SIZE'] = str(world_size)
@@ -38,11 +59,17 @@ def cleanup_distributed():
 def train_worker(rank, world_size, config):
     """Worker function for distributed training"""
     try:
+        print(f"Process {rank} CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not Set')}")
+        print(f"Process {rank} using GPU: {torch.cuda.current_device()}")
+        print(f"Available GPUs: {torch.cuda.device_count()}")
+        
+        logger = setup_logger(config['OUTPUT']['DIR'], rank)
+        logger.info(f"Process {rank} using GPU: {torch.cuda.current_device()}")
+        logger.info(f"Available GPUs: {torch.cuda.device_count()}")
+        
         # Setup distributed training for this worker
         setup_distributed_training(rank, world_size, config)
         
-        # Import and run training
-        from main import train
         train(config)
         
     except Exception as e:
