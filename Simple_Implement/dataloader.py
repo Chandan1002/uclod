@@ -6,6 +6,33 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 
+def save_crop_visualization(image, x, y, crop_size, output_path):
+    """Save visualization of crop location on original image"""
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    
+    # Create figure and axes
+    fig, ax = plt.subplots(1)
+    
+    # Display the image
+    ax.imshow(image)
+    
+    # Create a Rectangle patch
+    rect = patches.Rectangle((x, y), crop_size, crop_size, 
+                              linewidth=2, edgecolor='r', facecolor='none')
+    
+    # Add the patch to the Axes
+    ax.add_patch(rect)
+    
+    # Add center point
+    center_x = x + crop_size / 2
+    center_y = y + crop_size / 2
+    ax.plot(center_x, center_y, 'r.', markersize=10)
+    
+    # Save the visualization
+    plt.savefig(output_path)
+    plt.close()
+
 class UnsupervisedDataset(Dataset):
     def __init__(self, cfg, is_train=True):
         self.cfg = cfg
@@ -52,60 +79,72 @@ class UnsupervisedDataset(Dataset):
         return len(self.images)
         
     def random_crop(self, image):
-        """Generate random crop as per Section 3.5 of the paper"""
+        """Generate random crop coordinates ensuring crop is within original image bounds"""
         w, h = image.size
-        max_dim = max(w, h)
         
         # Crop size between 10% and 25% of max dimension
-        crop_size = random.uniform(0.10 * max_dim, 0.25 * max_dim)
-        crop_size = int(crop_size)
+        max_dim = max(w, h)
+        crop_size = int(random.uniform(0.10 * max_dim, 0.25 * max_dim))
         
-        # Ensure crop fits within image bounds
-        x = random.randint(0, max(0, w - crop_size))
-        y = random.randint(0, max(0, h - crop_size))
+        # Ensure crop fits within actual image bounds (not padded region)
+        max_x = w - crop_size
+        max_y = h - crop_size
+        
+        # If image is too small, adjust crop size
+        if max_x < 0 or max_y < 0:
+            crop_size = min(w, h)
+            max_x = w - crop_size
+            max_y = h - crop_size
+        
+        x = random.randint(0, max(0, max_x))
+        y = random.randint(0, max(0, max_y))
         
         return x, y, crop_size
     
+    # TODO: Crop before padding. Pad only to the right and at the bottom. Done!!
     def pad_image(self, image):
-        """Pad image to square with black borders"""
+        """Pad image only to the right and bottom to make it square"""
         w, h = image.size
         max_dim = max(w, h)
         padded = Image.new('RGB', (max_dim, max_dim), (0, 0, 0))
-        # Paste original image in center
-        x_offset = (max_dim - w) // 2
-        y_offset = (max_dim - h) // 2
-        padded.paste(image, (x_offset, y_offset))
-        return padded, (x_offset, y_offset)
-        
+        # Paste original image at top-left corner
+        padded.paste(image, (0, 0))
+        return padded, (0, 0)  # x_offset and y_offset are always 0
+    
     def __getitem__(self, idx):
         # Load image
         image_info = self.images[idx]
         image_path = os.path.join(self.image_dir, image_info['file_name'])
-        image = Image.open(image_path).convert('RGB')
+        original_image = Image.open(image_path).convert('RGB')
         
-        # Pad image to square
-        image, (x_offset, y_offset) = self.pad_image(image)
+        # First get crop from original unpadded image
+        x, y, crop_size = self.random_crop(original_image)
+        x_i = original_image.crop((x, y, x + crop_size, crop_size))
         
-        # Apply augmentations to original image (x_j)
-        x_j = self.augmentations(image)
+        # Then pad the original image (not the crop)
+        padded_image, _ = self.pad_image(original_image)
         
-        # Generate crop (x_i)
-        x, y, crop_size = self.random_crop(image)
-        x_i = image.crop((x, y, x + crop_size, y + crop_size))
+        # Apply augmentations
+        x_j = self.augmentations(padded_image)  # augment padded full image
+        x_i = self.augmentations(x_i)           # augment unpadded crop
         
-        # Apply augmentations to crop
-        x_i = self.augmentations(x_i)
+        # Save visualization for first 100 images only
+        if idx < 100:
+            viz_dir = os.path.join(self.cfg['OUTPUT']['DIR'], 'crop_visualizations')
+            os.makedirs(viz_dir, exist_ok=True)
+            viz_path = os.path.join(viz_dir, f'crop_viz_{idx}.png')
+            save_crop_visualization(padded_image, x, y, crop_size, viz_path)
         
         # Resize and convert both images to tensors
         x_i_tensor = self.base_transform(x_i)
         x_j_tensor = self.base_transform(x_j)
         
-        # Adjust crop coordinates to account for padding and resize
-        scale_w = self.target_size[0] / image.size[0]
-        scale_h = self.target_size[1] / image.size[1]
+        # Adjust crop coordinates for resize
+        scale_w = self.target_size[0] / original_image.size[0]
+        scale_h = self.target_size[1] / original_image.size[1]
         
-        x = (x - x_offset) * scale_w if x >= x_offset else 0
-        y = (y - y_offset) * scale_h if y >= y_offset else 0
+        x = x * scale_w
+        y = y * scale_h
         crop_size_w = crop_size * scale_w
         crop_size_h = crop_size * scale_h
         
