@@ -5,9 +5,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
+import numpy as np
 
 # Setup logger
 logger = logging.getLogger(__name__)
+
+def save_similarity_heatmap(similarity_map, orig_image, boxes, confidences, save_path):
+    """Save heatmap visualization with boxes"""
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # Plot original image with boxes
+    ax1.imshow(orig_image)
+    if boxes is not None and len(boxes) > 0 and not isinstance(boxes, float):
+        for box, conf in zip(boxes, confidences):
+            x, y, w, h = box
+            rect = patches.Rectangle((float(x), float(y)), float(w), float(h), 
+                                   linewidth=2, edgecolor='r', facecolor='none')
+            ax1.add_patch(rect)
+            ax1.text(float(x), float(y)-5, f'{float(conf):.2f}', color='red')
+    ax1.set_title('Detections')
+    
+    # Plot heatmap
+    heatmap = ax2.imshow(similarity_map, cmap='viridis')
+    plt.colorbar(heatmap, ax=ax2)
+    ax2.set_title('Similarity Heatmap')
+    
+    plt.savefig(save_path)
+    plt.close()
 
 class UnsupervisedDetector(nn.Module):
     def __init__(self, cfg):
@@ -29,32 +56,169 @@ class UnsupervisedDetector(nn.Module):
         self.temperature = cfg['MODEL']['PROJECTION']['TEMPERATURE']
         logger.info(f"Temperature parameter set to {self.temperature}")
 
+    def predict_boxes(self, features_map, confidence_threshold=0.00005):
+        """
+        Convert feature map to bounding box predictions
+        Returns empty tensors if no detections above threshold
+        """
+        try:
+            batch_size = features_map.size(0)
+            feature_size = features_map.size(2)  # Assuming square feature map
+            
+            # Get top confidences and indices
+            confidences, indices = features_map.view(batch_size, -1).max(dim=1)
+            
+            # Convert indices to grid coordinates
+            grid_size = 800 / feature_size  # Assuming 800x800 input image
+            y = (indices // feature_size) * grid_size
+            x = (indices % feature_size) * grid_size
+            
+            # Fixed size boxes
+            w = h = grid_size * 2
+            
+            # Stack coordinates [x, y, w, h]
+            boxes = torch.stack([x, y, w * torch.ones_like(x), h * torch.ones_like(x)], dim=1)
+            
+            # Filter by confidence
+            mask = confidences > confidence_threshold
+            if mask.any():
+                boxes = boxes[mask]
+                confidences = confidences[mask]
+            else:
+                # If no detections above threshold, return empty tensors
+                boxes = torch.zeros((0, 4), device=features_map.device)
+                confidences = torch.zeros(0, device=features_map.device)
+            
+            return boxes, confidences
+            
+        except Exception as e:
+            logger.error(f"Error in predict_boxes: {str(e)}")
+            # Return empty tensors on error
+            return (torch.zeros((0, 4), device=features_map.device), 
+                   torch.zeros(0, device=features_map.device))
+
+    def compute_similarity_map(self, features):
+        """Compute similarity map from features"""
+        # Normalize features
+        features = F.normalize(features, dim=1)
+        
+        # Compute similarity map
+        b, c, h, w = features.shape
+        features_flat = features.view(b, c, -1)
+        similarity_map = torch.bmm(features_flat.transpose(1, 2), features_flat)
+        similarity_map = similarity_map.view(b, h, w, h, w)
+        
+        # Get max similarity along spatial dimensions
+        similarity_map, _ = similarity_map.max(dim=-1)
+        similarity_map, _ = similarity_map.max(dim=-1)
+        
+        return similarity_map
+
+
     def forward(self, batch):
-        """Forward pass through both pipelines"""
-        logger.debug("Starting forward pass")
+        """Forward pass through model - handles both training and evaluation modes"""
+        if not self.training:
+            logger.debug("Running in evaluation mode")
+            # Evaluation mode
+            try:
+                x_j = batch['image_original']
+                fpn_outputs = self.pipeline2.fpn(x_j)
+                
+                # Safely get the first FPN level
+                first_level = sorted(fpn_outputs.keys())[0]
+                features = self.pipeline2.proj_head(fpn_outputs[first_level])
+
+                # Compute boxes and similarity map
+                boxes, confidences = self.predict_boxes(features)
+                similarity_map = self.compute_similarity_map(features)
+                
+                # Save visualization if enabled
+                if self.cfg['OUTPUT'].get('SAVE_VIZ', False):
+                    viz_dir = os.path.join(self.cfg['OUTPUT']['DIR'], 'detections')
+                    os.makedirs(viz_dir, exist_ok=True)
+                    if 'image_original' in batch:
+                        for i in range(len(boxes)):
+                            save_path = os.path.join(viz_dir, f'detection_{i}.png')
+                            orig_img = batch['image_original'][i].permute(1, 2, 0).cpu().numpy()
+                            # Extract numpy arrays
+                            boxes_np = boxes[i].cpu().numpy()
+                            confidences_np = confidences[i].cpu().numpy()
+                            
+                            # Handle single detection case
+                            if boxes_np.ndim == 1 and confidences_np.ndim == 0:
+                                boxes_np = boxes_np[np.newaxis, :]  # shape (1,4)
+                                confidences_np = np.array([confidences_np])  # shape (1,)
+                            # Now call the visualization function with standardized shapes
+                            save_similarity_heatmap(
+                                similarity_map[i].cpu().numpy(),
+                                batch['image_original'][i].permute(1,2,0).cpu().numpy(),
+                                boxes_np,
+                                confidences_np,
+                                save_path
+                            )
+                            
+                    else:
+                        logger.warning("No 'image_original' found in batch during evaluation, skipping visualization.")
+                
+                return {
+                    "boxes": boxes,
+                    "confidences": confidences,
+                    "similarity_map": similarity_map
+                }
+                
+            except Exception as e:
+                logger.error(f"Error in evaluation mode: {str(e)}")
+                raise
         
-        x_i = batch['image_crop']  # Random crop
-        x_j = batch['image_original']  # Full image
-        crop_coords = batch['crop_coords']
-        
-        batch_size = x_i.size(0)
-        logger.debug(f"Processing batch of size {batch_size}")
-        logger.debug(f"Crop tensor shape: {x_i.shape}")
-        logger.debug(f"Original image tensor shape: {x_j.shape}")
-        
-        # Pipeline 1: Process crop
-        z_i = self.pipeline1(x_i)
-        logger.debug(f"Pipeline 1 output shape: {z_i.shape}")
-        
-        # Pipeline 2: Process full image with FPN
-        z_j, z_a = self.pipeline2(x_j, crop_coords)
-        logger.debug(f"Pipeline 2 outputs - z_j shape: {z_j.shape}, z_a shape: {z_a.shape}")
-        
-        # Compute anchor-based NT-Xent loss
-        loss = self.compute_anchor_based_ntxent_loss(z_i, z_j, z_a, batch_size)
-        logger.debug(f"Computed loss: {loss.item():.4f}")
-        
-        return {"loss": loss}
+        # Training mode
+        logger.debug("Running in training mode")
+        try:
+            x_i = batch['image_crop']  # Random crop
+            x_j = batch['image_original']  # Full image
+            crop_coords = batch['crop_coords']
+            
+            batch_size = x_i.size(0)
+            logger.debug(f"Processing batch of size {batch_size}")
+            logger.debug(f"Crop tensor shape: {x_i.shape}")
+            logger.debug(f"Original image tensor shape: {x_j.shape}")
+            
+            # Pipeline 1: Process crop
+            z_i = self.pipeline1(x_i)
+            logger.debug(f"Pipeline 1 output shape: {z_i.shape}")
+            
+            # Pipeline 2: Process full image with FPN
+            z_j, z_a = self.pipeline2(x_j, crop_coords)
+            logger.debug(f"Pipeline 2 outputs - z_j shape: {z_j.shape}, z_a shape: {z_a.shape}")
+
+            # Calculate similarity map
+            z_i_norm = F.normalize(z_i, dim=1)
+            z_j_norm = F.normalize(z_j, dim=1)
+            similarity_map = torch.sum(z_i_norm.unsqueeze(2) * z_j_norm.unsqueeze(1), dim=1)
+            logger.debug(f"Similarity map shape: {similarity_map.shape}")
+            
+            # Compute anchor-based NT-Xent loss
+            loss = self.compute_anchor_based_ntxent_loss(z_i, z_j, z_a, batch_size)
+            logger.debug(f"Computed loss: {loss.item():.4f}")
+            
+            # Create output dictionary
+            output_dict = {
+                "loss": loss,
+                "similarity_map": similarity_map
+            }
+            
+            # Print output dict keys and shapes
+            logger.info("Output dictionary contents:")
+            for key, value in output_dict.items():
+                if isinstance(value, torch.Tensor):
+                    logger.info(f"{key}: shape {value.shape}")
+                else:
+                    logger.info(f"{key}: {value}")
+            
+            return output_dict
+            
+        except Exception as e:
+            logger.error(f"Error in training mode: {str(e)}")
+            raise
 
     def compute_anchor_based_ntxent_loss(self, z_i, z_j, z_a, batch_size):
         """Compute anchor-based NT-Xent loss with proper shape handling"""
