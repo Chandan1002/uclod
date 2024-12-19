@@ -1,6 +1,6 @@
 # System Configuration
 SYSTEM:
-  NUM_GPUS: 2  # Set to 2 or 4 for multi-GPU training
+  NUM_GPUS: 4  # Set to 2 or 4 for multi-GPU training
   NUM_WORKERS: 4
   DEVICE: "cuda"
   DEBUG_MODE: False
@@ -10,18 +10,20 @@ SYSTEM:
 DISTRIBUTED:
   ENABLED: True  # Must be True for multi-GPU
   BACKEND: "nccl"  # Use nccl for GPU training
-  WORLD_SIZE: 2  # Should match NUM_GPUS
+  WORLD_SIZE: 4  # Should match NUM_GPUS
   MASTER_ADDR: "localhost"
   MASTER_PORT: "12355"
 
 # Dataset Configuration
 DATASETS:
   PERCENTAGE: 10
-  ROOT: "/nfs/data/gist/ecx/coco"
+  # ROOT: "/nfs/data/gist/ecx/coco"
+  ROOT: "/home/data/ecx/coco"
 
 # Model Configuration
 MODEL:
   META_ARCHITECTURE: "UnsupervisedRCNN"
+  # WEIGHTS: "./output/20241212_140406/model_epoch_001_final.pth"
   WEIGHTS: ""
   PIXEL_MEAN: [0.485, 0.456, 0.406]  # ImageNet normalize values
   PIXEL_STD: [0.229, 0.224, 0.225]
@@ -41,7 +43,9 @@ INPUT:
 
 # Solver Configuration
 SOLVER:
+  EPOCHS: 100
   IMS_PER_BATCH: 2  # Per GPU batch size
+  GRADIENT_ACCUMULATION_STEPS: 64  # This will give us an effective batch size of 128
   BASE_LR: 0.0001
   WEIGHT_DECAY: 0.0001
   MAX_ITER: 10
@@ -55,3 +59,9 @@ OUTPUT:
   DIR: "./output"
   SAVE_PERIOD: 5000
   LOG_PERIOD: 100
+  SAVE_VIZ: True  # Enable detection visualization
+  EVAL_VIZ_DIR: "./eval_output/detections"
+
+EVAL:
+  ENABLED: True  # Set to True if you want evaluation after training
+  SAVE_VISUALIZATIONS: True  # Set to True to save detection visualizations
