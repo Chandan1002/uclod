@@ -16,7 +16,7 @@ DISTRIBUTED:
 
 # Dataset Configuration
 DATASETS:
-  PERCENTAGE: 10
+  PERCENTAGE: 100
   # ROOT: "/nfs/data/gist/ecx/coco"
   ROOT: "/home/data/ecx/coco"
 
@@ -43,7 +43,7 @@ INPUT:
 
 # Solver Configuration
 SOLVER:
-  EPOCHS: 100
+  EPOCHS: 2
   IMS_PER_BATCH: 2  # Per GPU batch size
   GRADIENT_ACCUMULATION_STEPS: 64  # This will give us an effective batch size of 128
   BASE_LR: 0.0001
