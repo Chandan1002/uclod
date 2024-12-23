@@ -10,17 +10,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-def save_metrics(output_dir, metrics):
-    """Save training metrics to a JSON file"""
-    metrics_path = os.path.join(output_dir, 'metrics.json')
-    with open(metrics_path, 'w') as f:
-        json.dump({
-            'accuracy': metrics['SGA'],    # Similarity Grid Accuracy
-            'riga': metrics['RIGA'],       # Random Initialization Grid Accuracy
-            'gap_r': metrics['GAP-R'],     # Grid Alignment Performance Ratio
-            'loss': metrics.get('final_loss', None),
-            'timestamp': datetime.now().isoformat()
-        }, f, indent=2)
 
 def load_config(config_file):
     """Load YAML configuration file"""
@@ -56,17 +45,16 @@ def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
 
+
 def train_worker(rank, world_size, config):
     """Worker function for distributed training"""
     try:
         print(f"Process {rank} CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not Set')}")
         print(f"Process {rank} using GPU: {torch.cuda.current_device()}")
         print(f"Available GPUs: {torch.cuda.device_count()}")
-        
         logger = setup_logger(config['OUTPUT']['DIR'], rank)
         logger.info(f"Process {rank} using GPU: {torch.cuda.current_device()}")
         logger.info(f"Available GPUs: {torch.cuda.device_count()}")
-        
         # Setup distributed training for this worker
         setup_distributed_training(rank, world_size, config)
         
@@ -80,6 +68,7 @@ def train_worker(rank, world_size, config):
         cleanup_distributed()
 
 def main():
+    # increase_shared_memory() 
     # Load configuration
     config = load_config('config.yaml')
     
