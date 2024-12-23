@@ -4,7 +4,6 @@ import numpy as np
 from collections import defaultdict
 import torch
 import torch.distributed as dist
-from functools import wraps
 from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 import datetime
@@ -13,6 +12,89 @@ import os
 
 logger = logging.getLogger(__name__)
 
+def calculate_grid_metrics(similarity_map, gt_box, random_init=None):
+    """Calculate grid alignment metrics (SGA, RIGA, GAP-R)
+    
+    Args:
+        similarity_map: Tensor containing similarity scores
+        gt_box: Ground truth bounding box coordinates [x, y, w, h]
+        random_init: Optional pre-computed random initialization map
+        
+    Returns:
+        dict: Dictionary containing SGA, RIGA and GAP-R metrics
+    """
+    # Calculate SGA
+    feature_map_size = int(similarity_map.shape[1] ** 0.5)
+    scale_factor = 800.0 / feature_map_size  # Assuming 800x800 input image
+    
+    # Get highest similarity location
+    max_idx = torch.argmax(similarity_map.flatten())
+    pred_y = (max_idx // feature_map_size) * scale_factor
+    pred_x = (max_idx % feature_map_size) * scale_factor
+    
+    # Check if prediction falls within ground truth box
+    is_inside = (
+        pred_x >= gt_box[0] and
+        pred_y >= gt_box[1] and
+        pred_x <= gt_box[0] + gt_box[2] and
+        pred_y <= gt_box[1] + gt_box[3]
+    )
+    
+    sga = float(is_inside)
+    
+    # Calculate RIGA using random initialization if provided
+    if random_init is None:
+        random_init = torch.rand_like(similarity_map)
+    rand_max_idx = torch.argmax(random_init.flatten())
+    rand_y = (rand_max_idx // feature_map_size) * scale_factor
+    rand_x = (rand_max_idx % feature_map_size) * scale_factor
+    
+    rand_is_inside = (
+        rand_x >= gt_box[0] and
+        rand_y >= gt_box[1] and
+        rand_x <= gt_box[0] + gt_box[2] and
+        rand_y <= gt_box[1] + gt_box[3]
+    )
+    
+    riga = float(rand_is_inside)
+    
+    # Calculate GAP-R
+    gap_r = sga / riga if riga > 0 else float('inf')
+    
+    return {
+        'SGA': sga,
+        'RIGA': riga,
+        'GAP-R': gap_r
+    }
+
+def save_metrics(output_dir, metrics, prefix=''):
+    """Save metrics to a JSON file
+    
+    Args:
+        output_dir: Directory to save the metrics
+        metrics: Dictionary containing metrics
+        prefix: Optional prefix for the output filename
+    """
+    timestamp = datetime.datetime.now().isoformat()
+    filename = f"{prefix}_metrics.json" if prefix else "metrics.json"
+    metrics_path = os.path.join(output_dir, filename)
+    
+    output_metrics = {
+        'accuracy': metrics.get('SGA', None),
+        'riga': metrics.get('RIGA', None),
+        'gap_r': metrics.get('GAP-R', None),
+        'loss': metrics.get('final_loss', None),
+        'timestamp': timestamp
+    }
+    
+    # Add any additional metrics that might be present
+    output_metrics.update({
+        k: v for k, v in metrics.items() 
+        if k not in ['SGA', 'RIGA', 'GAP-R', 'final_loss']
+    })
+    
+    with open(metrics_path, 'w') as f:
+        json.dump(output_metrics, f, indent=2)
 
 def calculate_iou(pred_box, gt_box):
     """Calculate IoU between prediction and ground truth boxes"""
@@ -29,7 +111,6 @@ def calculate_iou(pred_box, gt_box):
     union = pred_area + gt_area - intersection
     
     return intersection / union if union > 0 else 0
-
 
 def calculate_metrics(similarity_map, crop_coords, k=5):
     """Calculate AP and AR at different IoU thresholds"""
@@ -78,7 +159,8 @@ def calculate_metrics(similarity_map, crop_coords, k=5):
             precisions.append(precision)
             recalls.append(recall)
             
-            print(f"Pred {i} @ IoU {iou_threshold}: conf={pred['confidence']:.4f}, IoU={iou:.4f}")
+            # Debug print if needed
+            # print(f"Pred {i} @ IoU {iou_threshold}: conf={pred['confidence']:.4f}, IoU={iou:.4f}")
         
         # Calculate AP and AR for this threshold
         ap = max(precisions) if precisions else 0
@@ -89,14 +171,84 @@ def calculate_metrics(similarity_map, crop_coords, k=5):
     
     # Calculate mAP
     metrics['mAP'] = sum(metrics[f'AP{int(t*100)}'] for t in thresholds) / len(thresholds)
-    
-    print(f"AP50: {metrics['AP50']:.4f}")
-    print(f"AP75: {metrics['AP75']:.4f}")
-    print(f"AR50: {metrics['AR50']:.4f}")
-    print(f"AR75: {metrics['AR75']:.4f}")
-    print(f"mAP: {metrics['mAP']:.4f}")
+
+    # Add grid metrics
+    grid_metrics = calculate_grid_metrics(similarity_map, gt_box)
+    metrics.update(grid_metrics) 
     
     return metrics
+
+
+class CSVLoggerIter:
+    def __init__(self, log_dir, rank=0):
+        current_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        self.log_dir = Path(log_dir) / 'logs'
+        self.log_file = self.log_dir / f'iteration_metrics_{current_time}.csv'
+        self.rank = rank
+        self.fieldnames = ['iteration', 'timestamp', 'loss', 'map', 'lr', 'AP50', 'AP75', 'AR50', 'AR75', 'mAP', 'SGA', 'RIGA', 'GAP-R']
+
+        if rank == 0:
+            os.makedirs(self.log_dir, exist_ok=True)
+            with open(self.log_file, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                writer.writeheader()
+
+    def update(self, metrics_dict, iteration):
+        if self.rank != 0:
+            return
+        
+        row_dict = {
+            'iteration': iteration,
+            'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'loss': metrics_dict.get('loss', ''),
+            'map': metrics_dict.get('map', ''),
+            'lr': metrics_dict.get('lr', ''),
+            'AP50': metrics_dict.get('AP50', ''),
+            'AP75': metrics_dict.get('AP75', ''),
+            'AR50': metrics_dict.get('AR50', ''),
+            'AR75': metrics_dict.get('AR75', ''),
+            'mAP': metrics_dict.get('mAP', '')
+        }
+        
+        with open(self.log_file, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writerow(row_dict)
+
+
+class CSVLoggerEpoch:
+    def __init__(self, log_dir, rank=0):
+        current_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        self.log_dir = Path(log_dir) / 'logs'
+        self.log_file = self.log_dir / f'epoch_metrics_{current_time}.csv'
+        self.rank = rank
+        self.fieldnames = ['epoch', 'timestamp', 'loss', 'map', 'lr', 'AP50', 'AP75', 'AR50', 'AR75', 'mAP', 'SGA', 'RIGA', 'GAP-R']
+
+        if rank == 0:
+            os.makedirs(self.log_dir, exist_ok=True)
+            with open(self.log_file, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                writer.writeheader()
+    
+    def update_epoch(self, metrics_dict, epoch):
+        if self.rank != 0:
+            return
+        
+        row_dict = {
+            'epoch': epoch,
+            'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'loss': metrics_dict.get('loss', ''),
+            'map': metrics_dict.get('map', ''),
+            'lr': metrics_dict.get('lr', ''),
+            'AP50': metrics_dict.get('AP50', ''),
+            'AP75': metrics_dict.get('AP75', ''),
+            'AR50': metrics_dict.get('AR50', ''),
+            'AR75': metrics_dict.get('AR75', ''),
+            'mAP': metrics_dict.get('mAP', '')
+        }
+        
+        with open(self.log_file, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writerow(row_dict)
 
 
 class TensorboardLogger:
@@ -119,33 +271,6 @@ class TensorboardLogger:
         if self.writer is not None:
             self.writer.close()
 
-class CSVLogger:
-    def __init__(self, log_dir, rank=0):
-        current_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        self.log_dir = Path(log_dir) / 'logs'
-        self.log_file = self.log_dir / f'metrics_{current_time}.csv'
-        self.rank = rank
-        
-        if rank == 0:
-            os.makedirs(self.log_dir, exist_ok=True)
-            with open(self.log_file, 'w', newline='') as f:
-                f.write("iteration,timestamp,loss,map,lr\n")
-    
-    def update(self, metrics_dict, iteration):
-        if self.rank != 0:
-            return
-            
-        row_dict = {
-            'iteration': iteration,
-            'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'loss': metrics_dict.get('loss', ''),
-            'map': metrics_dict.get('map', ''),
-            'lr': metrics_dict.get('lr', '')
-        }
-        
-        with open(self.log_file, 'a', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['iteration', 'timestamp', 'loss', 'map', 'lr'])
-            writer.writerow(row_dict)
 
 class MetricsLogger:
     def __init__(self, log_dir, distributed=False):
@@ -154,13 +279,15 @@ class MetricsLogger:
         self.running_metrics = defaultdict(float)
         self.n_steps = 0
         
-        # Initialize loggers
         rank = dist.get_rank() if distributed else 0
         self.tb_logger = TensorboardLogger(log_dir, rank)
-        self.csv_logger = CSVLogger(log_dir, rank)
+        
+        # Separate CSV loggers for iteration and epoch
+        self.csv_logger_iter = CSVLoggerIter(log_dir, rank)
+        self.csv_logger_epoch = CSVLoggerEpoch(log_dir, rank)
     
     def update(self, metrics_dict, iteration, log_to_console=True):
-        # Average metrics across GPUs if distributed
+        # Average metrics if distributed
         if self.distributed:
             gathered_metrics = {}
             for key, value in metrics_dict.items():
@@ -178,22 +305,64 @@ class MetricsLogger:
             self.running_metrics[key] += value
         self.n_steps += 1
         
+        # Log iteration-level metrics to CSV
+        self.csv_logger_iter.update(metrics_dict, iteration)
+        
         # Log to TensorBoard
         for key, value in metrics_dict.items():
             self.tb_logger.add_scalar(f'train/{key}', value, iteration)
         
-        # Log to CSV
-        self.csv_logger.update(metrics_dict, iteration)
-        
-        # Log to console if requested
         if log_to_console and (not self.distributed or (self.distributed and dist.get_rank() == 0)):
             log_str = f"Iteration {iteration} |"
             for key, value in metrics_dict.items():
-                log_str += f" {key}: {value:.4f} |"
+                if isinstance(value, float):
+                    log_str += f" {key}: {value:.4f} |"
+                else:
+                    log_str += f" {key}: {value} |"
             logger.info(log_str)
     
+    def update_epoch(self, epoch_metrics_dict, epoch, log_to_console=True):
+        # Average metrics if distributed
+        if self.distributed:
+            gathered_metrics = {}
+            for key, value in epoch_metrics_dict.items():
+                if isinstance(value, torch.Tensor):
+                    value = value.clone().detach()
+                    dist.all_reduce(value)
+                    value = value / dist.get_world_size()
+                gathered_metrics[key] = value
+            epoch_metrics_dict = gathered_metrics
+
+        # Log epoch-level metrics to separate CSV
+        self.csv_logger_epoch.update_epoch(epoch_metrics_dict, epoch)
+        
+        if log_to_console and (not self.distributed or (self.distributed and dist.get_rank() == 0)):
+            log_str = f"Epoch {epoch} |"
+            for key, value in epoch_metrics_dict.items():
+                if isinstance(value, float):
+                    log_str += f" {key}: {value:.4f} |"
+                else:
+                    log_str += f" {key}: {value} |"
+            logger.info(log_str)
+
+    def update_grid_metrics(self, similarity_map, gt_box, iteration):
+        """Update grid alignment metrics
+        
+        Args:
+            similarity_map: Tensor containing similarity scores
+            gt_box: Ground truth bounding box coordinates
+            iteration: Current iteration number
+        """
+        grid_metrics = calculate_grid_metrics(similarity_map, gt_box)
+        
+        # Log to CSV and tensorboard
+        self.update(grid_metrics, iteration)
+        
+        # Save detailed metrics at regular intervals or specific iterations
+        if iteration % self.cfg.OUTPUT.SAVE_PERIOD == 0:
+            save_metrics(self.log_dir, grid_metrics, prefix=f'iter_{iteration}')
+            
     def log_gpu_stats(self, iteration):
-        """Log GPU memory statistics"""
         if torch.cuda.is_available() and (not self.distributed or (self.distributed and dist.get_rank() == 0)):
             for i in range(torch.cuda.device_count()):
                 allocated = torch.cuda.memory_allocated(i) / 1024**2  # MB
@@ -203,6 +372,8 @@ class MetricsLogger:
     
     def close(self):
         self.tb_logger.close()
+
+
 
 class PerformanceMetrics:
     def __init__(self, model, metrics_logger):
@@ -217,12 +388,14 @@ class PerformanceMetrics:
     def update(self, metrics_dict, iteration, lr=None, log_to_console=True):
         if lr is not None:
             metrics_dict['lr'] = lr
-        
         self.metrics_logger.update(metrics_dict, iteration, log_to_console)
         
         if 'loss' in metrics_dict:
             self.total_loss += metrics_dict['loss']
         self.n_steps += 1
+    
+    def update_epoch(self, epoch_metrics_dict, epoch, log_to_console=True):
+        self.metrics_logger.update_epoch(epoch_metrics_dict, epoch, log_to_console)
     
     def log_gpu_stats(self, iteration):
         self.metrics_logger.log_gpu_stats(iteration)
