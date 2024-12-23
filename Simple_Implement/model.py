@@ -6,35 +6,38 @@ import torch.nn.functional as F
 import torchvision.models as models
 from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from torchvision.utils import make_grid
 
 # Setup logger
 logger = logging.getLogger(__name__)
 
-def save_similarity_heatmap(similarity_map, orig_image, boxes, confidences, save_path):
-    """Save heatmap visualization with boxes"""
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
+# def save_similarity_heatmap(similarity_map, orig_image, boxes, confidences, save_path):
+#     """Save heatmap visualization with boxes"""
+#     import matplotlib.pyplot as plt
+#     import matplotlib.patches as patches
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+#     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     
-    # Plot original image with boxes
-    ax1.imshow(orig_image)
-    if boxes is not None and len(boxes) > 0 and not isinstance(boxes, float):
-        for box, conf in zip(boxes, confidences):
-            x, y, w, h = box
-            rect = patches.Rectangle((float(x), float(y)), float(w), float(h), 
-                                   linewidth=2, edgecolor='r', facecolor='none')
-            ax1.add_patch(rect)
-            ax1.text(float(x), float(y)-5, f'{float(conf):.2f}', color='red')
-    ax1.set_title('Detections')
+#     # Plot original image with boxes
+#     ax1.imshow(orig_image)
+#     if boxes is not None and len(boxes) > 0 and not isinstance(boxes, float):
+#         for box, conf in zip(boxes, confidences):
+#             x, y, w, h = box
+#             rect = patches.Rectangle((float(x), float(y)), float(w), float(h), 
+#                                    linewidth=2, edgecolor='r', facecolor='none')
+#             ax1.add_patch(rect)
+#             ax1.text(float(x), float(y)-5, f'{float(conf):.2f}', color='red')
+#     ax1.set_title('Detections')
     
-    # Plot heatmap
-    heatmap = ax2.imshow(similarity_map, cmap='viridis')
-    plt.colorbar(heatmap, ax=ax2)
-    ax2.set_title('Similarity Heatmap')
+#     # Plot heatmap
+#     heatmap = ax2.imshow(similarity_map, cmap='viridis')
+#     plt.colorbar(heatmap, ax=ax2)
+#     ax2.set_title('Similarity Heatmap')
     
-    plt.savefig(save_path)
-    plt.close()
+#     plt.savefig(save_path)
+#     plt.close()
 
 class UnsupervisedDetector(nn.Module):
     def __init__(self, cfg):
@@ -56,7 +59,7 @@ class UnsupervisedDetector(nn.Module):
         self.temperature = cfg['MODEL']['PROJECTION']['TEMPERATURE']
         logger.info(f"Temperature parameter set to {self.temperature}")
 
-    def predict_boxes(self, features_map, confidence_threshold=0.00005):
+    def predict_boxes(self, features_map, confidence_threshold=0.0000000000000001):
         """
         Convert feature map to bounding box predictions
         Returns empty tensors if no detections above threshold
@@ -132,33 +135,46 @@ class UnsupervisedDetector(nn.Module):
                 boxes, confidences = self.predict_boxes(features)
                 similarity_map = self.compute_similarity_map(features)
                 
-                # Save visualization if enabled
+                # # Save visualization if enabled
+                # if self.cfg['OUTPUT'].get('SAVE_VIZ', False):
+                #     viz_dir = os.path.join(self.cfg['OUTPUT']['DIR'], 'detections')
+                #     os.makedirs(viz_dir, exist_ok=True)
+                #     if 'image_original' in batch:
+                #         for i in range(len(boxes)):
+                #             save_path = os.path.join(viz_dir, f'detection_{i}.png')
+                #             orig_img = batch['image_original'][i].permute(1, 2, 0).cpu().numpy()
+                #             # Extract numpy arrays
+                #             boxes_np = boxes[i].cpu().numpy()
+                #             confidences_np = confidences[i].cpu().numpy()
+                            
+                #             # Handle single detection case
+                #             if boxes_np.ndim == 1 and confidences_np.ndim == 0:
+                #                 boxes_np = boxes_np[np.newaxis, :]  # shape (1,4)
+                #                 confidences_np = np.array([confidences_np])  # shape (1,)
+                #             # Now call the visualization function with standardized shapes
+                #             save_similarity_heatmap(
+                #                 similarity_map[i].cpu().numpy(),
+                #                 batch['image_original'][i].permute(1,2,0).cpu().numpy(),
+                #                 boxes_np,
+                #                 confidences_np,
+                #                 save_path
+                #             )
                 if self.cfg['OUTPUT'].get('SAVE_VIZ', False):
-                    viz_dir = os.path.join(self.cfg['OUTPUT']['DIR'], 'detections')
-                    os.makedirs(viz_dir, exist_ok=True)
-                    if 'image_original' in batch:
-                        for i in range(len(boxes)):
-                            save_path = os.path.join(viz_dir, f'detection_{i}.png')
-                            orig_img = batch['image_original'][i].permute(1, 2, 0).cpu().numpy()
-                            # Extract numpy arrays
-                            boxes_np = boxes[i].cpu().numpy()
-                            confidences_np = confidences[i].cpu().numpy()
-                            
-                            # Handle single detection case
-                            if boxes_np.ndim == 1 and confidences_np.ndim == 0:
-                                boxes_np = boxes_np[np.newaxis, :]  # shape (1,4)
-                                confidences_np = np.array([confidences_np])  # shape (1,)
-                            # Now call the visualization function with standardized shapes
-                            save_similarity_heatmap(
-                                similarity_map[i].cpu().numpy(),
-                                batch['image_original'][i].permute(1,2,0).cpu().numpy(),
-                                boxes_np,
-                                confidences_np,
-                                save_path
-                            )
-                            
-                    else:
-                        logger.warning("No 'image_original' found in batch during evaluation, skipping visualization.")
+                    from visualization import EvalVisualization
+                    visualizer = EvalVisualization(self.cfg)
+                    for i in range(len(batch['image_original'])):
+                        visualizer.save_detection_visualization(
+                            image=batch['image_original'][i],
+                            similarity_map=similarity_map[i],
+                            pred_boxes=boxes[i:i+1] if boxes is not None else None,
+                            gt_boxes=batch.get('crop_coords', None),
+                            confidences=confidences[i:i+1] if confidences is not None else None,
+                            metrics=None,  # Metrics calculated in evaluate()
+                            batch_idx=0,  # These will be set in evaluate()
+                            sample_idx=i
+                        )       
+                    # else:
+                    #     logger.warning("No 'image_original' found in batch during evaluation, skipping visualization.")
                 
                 return {
                     "boxes": boxes,
@@ -198,7 +214,7 @@ class UnsupervisedDetector(nn.Module):
             
             # Compute anchor-based NT-Xent loss
             loss = self.compute_anchor_based_ntxent_loss(z_i, z_j, z_a, batch_size)
-            logger.debug(f"Computed loss: {loss.item():.4f}")
+            logger.debug(f"Computed loss: {loss.item():.16f}")
             
             # Create output dictionary
             output_dict = {
