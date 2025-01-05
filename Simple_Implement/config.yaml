@@ -1,7 +1,7 @@
 # System Configuration
 SYSTEM:
-  NUM_GPUS: 4  # Set to 2 or 4 for multi-GPU training
-  NUM_WORKERS: 4
+  NUM_GPUS: 1  # Set to 2 or 4 for multi-GPU training
+  NUM_WORKERS: 1
   DEVICE: "cuda"
   DEBUG_MODE: False
   SEED: 42
@@ -10,7 +10,7 @@ SYSTEM:
 DISTRIBUTED:
   ENABLED: True  # Must be True for multi-GPU
   BACKEND: "nccl"  # Use nccl for GPU training
-  WORLD_SIZE: 4  # Should match NUM_GPUS
+  WORLD_SIZE: 1  # Should match NUM_GPUS
   MASTER_ADDR: "localhost"
   MASTER_PORT: "12355"
 
@@ -18,12 +18,14 @@ DISTRIBUTED:
 DATASETS:
   PERCENTAGE: 100
   # ROOT: "/nfs/data/gist/ecx/coco"
-  ROOT: "/home/data/ecx/coco"
+  # ROOT: "/home/data/ecx/coco"
+  ROOT: "/mnt/drive_test/coco"
 
 # Model Configuration
 MODEL:
   META_ARCHITECTURE: "UnsupervisedRCNN"
   # WEIGHTS: "./output/20241212_140406/model_epoch_001_final.pth"
+  WEIGHTS: "./output/20241225_212615/model_final.pth"
   WEIGHTS: ""
   PIXEL_MEAN: [0.485, 0.456, 0.406]  # ImageNet normalize values
   PIXEL_STD: [0.229, 0.224, 0.225]
