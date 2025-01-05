@@ -7,6 +7,28 @@ from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CocoDetection
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
 
+def move_to_device(obj, device):
+    """
+    Recursively moves all tensors in a nested structure to the specified device.
+    
+    Args:
+        obj: The object to move to the device. Can be a dict, list, tuple, or tensor.
+        device: The target device (e.g., 'cuda' or 'cpu').
+    
+    Returns:
+        The object with all tensors moved to the specified device.
+    """
+    if isinstance(obj, dict):  # If obj is a dictionary
+        return {k: move_to_device(v, device) for k, v in obj.items()}
+    elif isinstance(obj, list):  # If obj is a list
+        return [move_to_device(v, device) for v in obj]
+    elif isinstance(obj, tuple):  # If obj is a tuple
+        return tuple(move_to_device(v, device) for v in obj)
+    elif torch.is_tensor(obj):  # If obj is a tensor
+        return obj.to(device)
+    else:
+        return obj  # If not a tensor, return as is
+
 # Step 1: Setup COCO dataset
 transform = T.Compose(
     [T.ToTensor(), T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
@@ -75,15 +97,7 @@ for epoch in range(num_epochs):
     epoch_loss = 0
     for images, targets in train_loader:
         images = list(image.to(device) for image in images)
-        # targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-        print(len(targets))
-        for t in targets:
-            print(type(t), len(t))
-            for b in t:
-                for k, v in b.items():
-                    print(k, end=" ")
-                print()
-        exit()
+        targets = move_to_device(obj=targets, device=device)
 
         optimizer.zero_grad()
         loss_dict = model(images, targets)
@@ -108,3 +122,4 @@ def evaluate(model, data_loader, device):
 
 
 evaluate(model, val_loader, device)
+
