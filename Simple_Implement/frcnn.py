@@ -7,14 +7,38 @@ from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CocoDetection
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
 
+
+class CustomCocoDetection(CocoDetection):
+    def __getitem__(self, idx):
+        img, target = super().__getitem__(idx)
+
+        # Extract bounding boxes and labels
+        boxes = [obj["bbox"] for obj in target]
+        labels = [obj["category_id"] for obj in target]
+
+        if len(boxes) == 0:  # Handle images with no objects
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64)
+        else:
+            # Convert to tensors
+            boxes = torch.tensor(boxes, dtype=torch.float32)
+            labels = torch.tensor(labels, dtype=torch.int64)
+
+            # COCO bounding boxes are [x, y, width, height]; convert to [x_min, y_min, x_max, y_max]
+            boxes[:, 2:] += boxes[:, :2]  # Convert width/height to max coords
+
+        target = {"boxes": boxes, "labels": labels}
+        return img, target
+
+
 def move_to_device(obj, device):
     """
     Recursively moves all tensors in a nested structure to the specified device.
-    
+
     Args:
         obj: The object to move to the device. Can be a dict, list, tuple, or tensor.
         device: The target device (e.g., 'cuda' or 'cpu').
-    
+
     Returns:
         The object with all tensors moved to the specified device.
     """
@@ -29,18 +53,19 @@ def move_to_device(obj, device):
     else:
         return obj  # If not a tensor, return as is
 
+
 # Step 1: Setup COCO dataset
 transform = T.Compose(
     [T.ToTensor(), T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
 )
 
-train_dataset = CocoDetection(
+train_dataset = CustomCocoDetection(
     root="/mnt/drive_test/coco/train2017",
     annFile="/mnt/drive_test/coco/annotations/instances_train2017.json",
     transform=transform,
 )
 
-val_dataset = CocoDetection(
+val_dataset = CustomCocoDetection(
     root="/mnt/drive_test/coco/val2017",
     annFile="/mnt/drive_test/coco/annotations/instances_val2017.json",
     transform=transform,
@@ -92,12 +117,14 @@ device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 model.to(device)
 
 num_epochs = 10
-for epoch in range(num_epochs):
-    model.train()
+for epoch in range(0, num_epochs):
     epoch_loss = 0
     for images, targets in train_loader:
-        images = list(image.to(device) for image in images)
-        targets = move_to_device(obj=targets, device=device)
+        # Move images to device
+        images = [image.to(device) for image in images]
+
+        # Move each target dictionary in the list to the device
+        targets = move_to_device(targets, device)
 
         optimizer.zero_grad()
         loss_dict = model(images, targets)
@@ -106,8 +133,9 @@ for epoch in range(num_epochs):
         optimizer.step()
 
         epoch_loss += losses.item()
+        print("step loss", losses.item())
 
-    lr_scheduler.step()
+        lr_scheduler.step()
     print(f"Epoch {epoch + 1}, Loss: {epoch_loss}")
 
 
@@ -122,4 +150,3 @@ def evaluate(model, data_loader, device):
 
 
 evaluate(model, val_loader, device)
-
