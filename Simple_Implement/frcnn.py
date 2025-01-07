@@ -6,6 +6,8 @@ import torchvision.transforms as T
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CocoDetection
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from pycocotools.cocoeval import COCOeval
+
 
 
 class CustomCocoDetection(CocoDetection):
@@ -27,7 +29,10 @@ class CustomCocoDetection(CocoDetection):
             # COCO bounding boxes are [x, y, width, height]; convert to [x_min, y_min, x_max, y_max]
             boxes[:, 2:] += boxes[:, :2]  # Convert width/height to max coords
 
-        target = {"boxes": boxes, "labels": labels}
+        # Add the image_id to the target dictionary
+        image_id = target[0]["image_id"] if len(target) > 0 else idx  # Use idx if image_id is unavailable
+        target = {"boxes": boxes, "labels": labels, "image_id": torch.tensor(image_id, dtype=torch.int64)}
+
         return img, target
 
 
@@ -116,37 +121,92 @@ lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 model.to(device)
 
-num_epochs = 10
-for epoch in range(0, num_epochs):
-    epoch_loss = 0
-    for images, targets in train_loader:
-        # Move images to device
-        images = [image.to(device) for image in images]
+def train(model, dataloader, device):
+    num_epochs = 10
+    model.train()
+    for epoch in range(0, num_epochs):
+        epoch_loss = 0
+        for images, targets in dataloader:
+            # Move images to device
+            images = [image.to(device) for image in images]
 
-        # Move each target dictionary in the list to the device
-        targets = move_to_device(targets, device)
+            # Move each target dictionary in the list to the device
+            targets = move_to_device(targets, device)
 
-        optimizer.zero_grad()
-        loss_dict = model(images, targets)
-        losses = sum(loss for loss in loss_dict.values())
-        losses.backward()
-        optimizer.step()
+            optimizer.zero_grad()
+            loss_dict = model(images, targets)
+            losses = sum(loss for loss in loss_dict.values())
+            losses.backward()
+            optimizer.step()
 
-        epoch_loss += losses.item()
-        print("step loss", losses.item())
+            epoch_loss += losses.item()
+            print("step loss", losses.item())
 
-        lr_scheduler.step()
-    print(f"Epoch {epoch + 1}, Loss: {epoch_loss}")
+            lr_scheduler.step()
+        print(f"Epoch {epoch + 1}, Loss: {epoch_loss}")
 
 
 # Step 5: Evaluation
-def evaluate(model, data_loader, device):
+def evaluate(model, dataloader, device):
+    # model.eval()
+    # with torch.no_grad():
+    #     for images, targets in dataloader:
+    #         images = list(img.to(device) for img in images)
+    #         outputs = model(images)
     model.eval()
+    all_predictions = []
+    all_targets = []
+
     with torch.no_grad():
-        for images, targets in data_loader:
-            images = list(img.to(device) for img in images)
+        for images, targets in dataloader:
+            print('going over batch')
+            # Move images and targets to the device
+            images = [img.to(device) for img in images]
+            targets = move_to_device(targets, device)
+
+            # Get model predictions
             outputs = model(images)
-            # Perform evaluation (e.g., calculate mAP)
+
+            # Process outputs and targets for COCO evaluation
+            for i, output in enumerate(outputs):
+                image_id = targets[i]["image_id"].item()
+
+                # Add predictions for this image
+                for box, label, score in zip(output["boxes"].cpu(), output["labels"].cpu(), output["scores"].cpu()):
+                    x_min, y_min, x_max, y_max = box.tolist()
+                    width, height = x_max - x_min, y_max - y_min
+                    all_predictions.append({
+                        "image_id": image_id,
+                        "category_id": int(label.item()),
+                        "bbox": [x_min, y_min, width, height],
+                        "score": float(score.item()),
+                    })
+
+                # Add ground truth for this image
+                for box, label in zip(targets[i]["boxes"].cpu(), targets[i]["labels"].cpu()):
+                    x_min, y_min, x_max, y_max = box.tolist()
+                    width, height = x_max - x_min, y_max - y_min
+                    all_targets.append({
+                        "image_id": image_id,
+                        "category_id": int(label.item()),
+                        "bbox": [x_min, y_min, width, height],
+                    })
+
+    # Load ground truth and predictions into COCO API format
+    coco_gt = val_dataset.coco  # Use the COCO object from the dataset
+    coco_dt = coco_gt.loadRes(all_predictions)
+
+    # Evaluate using COCOeval
+    coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
+    coco_eval.evaluate()
+    coco_eval.accumulate()
+    coco_eval.summarize()
+
+    print(coco_eval.stats)
+
+    # Optionally return detailed results
+    # return coco_eval.stats
 
 
+# train(model, train_loader, device)
 evaluate(model, val_loader, device)
