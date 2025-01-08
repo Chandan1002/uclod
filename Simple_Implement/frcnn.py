@@ -114,9 +114,7 @@ pretrained_weights = torch.load("./output/20241225_212615/model_final.pth")
 model.load_state_dict(pretrained_weights, strict=False)
 
 # Step 3: Define the optimizer and learning rate scheduler
-optimizer = torch.optim.SGD(
-    model.parameters(), lr=0.005, momentum=0.9, weight_decay=0.0005
-)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0005)
 lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
 
 # Step 4: Training loop
@@ -145,7 +143,7 @@ def train(model, dataloader, device):
             epoch_loss += losses.item()
             print("step loss", losses.item())
 
-            lr_scheduler.step()
+        lr_scheduler.step()
         print(f"Epoch {epoch + 1}, Loss: {epoch_loss/len(dataloader)}")
 
 
@@ -187,8 +185,8 @@ def evaluate(model, dataloader, device):
                     all_predictions.append(prediction)
 
     # Validate image IDs
-    print("Prediction image_ids:", set([p["image_id"] for p in all_predictions]))
-    print("Ground truth image_ids:", set(val_dataset.coco.getImgIds()))
+    # print("Prediction image_ids:", set([p["image_id"] for p in all_predictions]))
+    # print("Ground truth image_ids:", set(val_dataset.coco.getImgIds()))
 
     # Filter out predictions with invalid image_ids
     valid_img_ids = set(val_dataset.coco.getImgIds())
