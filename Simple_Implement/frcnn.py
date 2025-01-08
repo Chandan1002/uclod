@@ -3,11 +3,11 @@ import random
 import torch
 import torchvision
 import torchvision.transforms as T
+from pycocotools.cocoeval import COCOeval
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CocoDetection
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
-from pycocotools.cocoeval import COCOeval
-
+from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 
 
 class CustomCocoDetection(CocoDetection):
@@ -26,13 +26,15 @@ class CustomCocoDetection(CocoDetection):
             boxes = torch.tensor(boxes, dtype=torch.float32)
             labels = torch.tensor(labels, dtype=torch.int64)
 
-            # COCO bounding boxes are [x, y, width, height]; convert to [x_min, y_min, x_max, y_max]
+            # Convert [x, y, width, height] to [x_min, y_min, x_max, y_max]
             boxes[:, 2:] += boxes[:, :2]  # Convert width/height to max coords
 
-        # Add the image_id to the target dictionary
-        image_id = target[0]["image_id"] if len(target) > 0 else idx  # Use idx if image_id is unavailable
-        target = {"boxes": boxes, "labels": labels, "image_id": torch.tensor(image_id, dtype=torch.int64)}
+            # Filter out invalid boxes (width or height <= 0)
+            valid_indices = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+            boxes = boxes[valid_indices]
+            labels = labels[valid_indices]
 
+        target = {"boxes": boxes, "labels": labels, "image_id": torch.tensor([idx])}
         return img, target
 
 
@@ -121,8 +123,9 @@ lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 model.to(device)
 
+
 def train(model, dataloader, device):
-    num_epochs = 10
+    num_epochs = 1
     model.train()
     for epoch in range(0, num_epochs):
         epoch_loss = 0
@@ -143,23 +146,18 @@ def train(model, dataloader, device):
             print("step loss", losses.item())
 
             lr_scheduler.step()
-        print(f"Epoch {epoch + 1}, Loss: {epoch_loss}")
+        print(f"Epoch {epoch + 1}, Loss: {epoch_loss/len(dataloader)}")
 
 
 # Step 5: Evaluation
 def evaluate(model, dataloader, device):
-    # model.eval()
-    # with torch.no_grad():
-    #     for images, targets in dataloader:
-    #         images = list(img.to(device) for img in images)
-    #         outputs = model(images)
     model.eval()
     all_predictions = []
     all_targets = []
 
     with torch.no_grad():
         for images, targets in dataloader:
-            print('going over batch')
+            print("going over batch")
             # Move images and targets to the device
             images = [img.to(device) for img in images]
             targets = move_to_device(targets, device)
@@ -170,27 +168,31 @@ def evaluate(model, dataloader, device):
             # Process outputs and targets for COCO evaluation
             for i, output in enumerate(outputs):
                 image_id = targets[i]["image_id"].item()
+                for box, label, score in zip(
+                    output["boxes"].cpu().numpy(),
+                    output["labels"].cpu().numpy(),
+                    output["scores"].cpu().numpy(),
+                ):
+                    prediction = {
+                        "image_id": image_id,  # Include image_id
+                        "category_id": int(label),  # COCO category ID
+                        "bbox": [
+                            float(box[0]),  # x_min
+                            float(box[1]),  # y_min
+                            float(box[2] - box[0]),  # width
+                            float(box[3] - box[1]),  # height
+                        ],
+                        "score": float(score),  # Confidence score
+                    }
+                    all_predictions.append(prediction)
 
-                # Add predictions for this image
-                for box, label, score in zip(output["boxes"].cpu(), output["labels"].cpu(), output["scores"].cpu()):
-                    x_min, y_min, x_max, y_max = box.tolist()
-                    width, height = x_max - x_min, y_max - y_min
-                    all_predictions.append({
-                        "image_id": image_id,
-                        "category_id": int(label.item()),
-                        "bbox": [x_min, y_min, width, height],
-                        "score": float(score.item()),
-                    })
+    # Validate image IDs
+    print("Prediction image_ids:", set([p["image_id"] for p in all_predictions]))
+    print("Ground truth image_ids:", set(val_dataset.coco.getImgIds()))
 
-                # Add ground truth for this image
-                for box, label in zip(targets[i]["boxes"].cpu(), targets[i]["labels"].cpu()):
-                    x_min, y_min, x_max, y_max = box.tolist()
-                    width, height = x_max - x_min, y_max - y_min
-                    all_targets.append({
-                        "image_id": image_id,
-                        "category_id": int(label.item()),
-                        "bbox": [x_min, y_min, width, height],
-                    })
+    # Filter out predictions with invalid image_ids
+    valid_img_ids = set(val_dataset.coco.getImgIds())
+    all_predictions = [p for p in all_predictions if p["image_id"] in valid_img_ids]
 
     # Load ground truth and predictions into COCO API format
     coco_gt = val_dataset.coco  # Use the COCO object from the dataset
@@ -204,9 +206,8 @@ def evaluate(model, dataloader, device):
 
     print(coco_eval.stats)
 
-    # Optionally return detailed results
-    # return coco_eval.stats
 
-
-# train(model, train_loader, device)
-evaluate(model, val_loader, device)
+for i in range(0, 100):
+    print("Epoch", i)
+    train(model, train_loader, device)
+    evaluate(model, val_loader, device)
