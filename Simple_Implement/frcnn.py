@@ -61,65 +61,6 @@ def move_to_device(obj, device):
         return obj  # If not a tensor, return as is
 
 
-# Step 1: Setup COCO dataset
-transform = T.Compose(
-    [T.ToTensor(), T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
-)
-
-train_dataset = CustomCocoDetection(
-    root="/mnt/drive_test/coco/train2017",
-    annFile="/mnt/drive_test/coco/annotations/instances_train2017.json",
-    transform=transform,
-)
-
-val_dataset = CustomCocoDetection(
-    root="/mnt/drive_test/coco/val2017",
-    annFile="/mnt/drive_test/coco/annotations/instances_val2017.json",
-    transform=transform,
-)
-
-# Reduce training dataset to 10%
-train_indices = list(range(len(train_dataset)))
-random.shuffle(train_indices)
-subset_size = int(0.1 * len(train_indices))
-train_subset = Subset(train_dataset, train_indices[:subset_size])
-
-train_loader = DataLoader(
-    train_subset,
-    batch_size=4,
-    shuffle=True,
-    num_workers=4,
-    collate_fn=lambda x: tuple(zip(*x)),
-)
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=4,
-    shuffle=False,
-    num_workers=4,
-    collate_fn=lambda x: tuple(zip(*x)),
-)
-
-# Step 2: Load pre-trained Faster R-CNN with FPN model
-model = fasterrcnn_resnet50_fpn(pretrained=False)
-
-# Replace the classification head to match the number of COCO classes
-num_classes = 91  # 80 classes + background + other special classes
-in_features = model.roi_heads.box_predictor.cls_score.in_features
-model.roi_heads.box_predictor = (
-    torchvision.models.detection.faster_rcnn.FastRCNNPredictor(in_features, num_classes)
-)
-
-# Load the pre-trained weights
-pretrained_weights = torch.load("./output/20241225_212615/model_final.pth")
-model.load_state_dict(pretrained_weights, strict=False)
-
-# Step 3: Define the optimizer and learning rate scheduler
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0005)
-lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
-
-# Step 4: Training loop
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-model.to(device)
 
 
 def train(model, dataloader, device):
@@ -188,6 +129,10 @@ def evaluate(model, dataloader, device):
     # print("Prediction image_ids:", set([p["image_id"] for p in all_predictions]))
     # print("Ground truth image_ids:", set(val_dataset.coco.getImgIds()))
 
+    if len(set([p["image_id"] for p in all_predictions])) == 0:
+        print("Did not worked")
+        return
+
     # Filter out predictions with invalid image_ids
     valid_img_ids = set(val_dataset.coco.getImgIds())
     all_predictions = [p for p in all_predictions if p["image_id"] in valid_img_ids]
@@ -205,7 +150,69 @@ def evaluate(model, dataloader, device):
     print(coco_eval.stats)
 
 
-for i in range(0, 100):
-    print("Epoch", i)
-    train(model, train_loader, device)
-    evaluate(model, val_loader, device)
+if __name__ == "__main__":
+    # Step 1: Setup COCO dataset
+    transform = T.Compose(
+        [T.ToTensor(), T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
+    )
+
+    train_dataset = CustomCocoDetection(
+        root="/mnt/drive_test/coco/train2017",
+        annFile="/mnt/drive_test/coco/annotations/instances_train2017.json",
+        transform=transform,
+    )
+
+    val_dataset = CustomCocoDetection(
+        root="/mnt/drive_test/coco/val2017",
+        annFile="/mnt/drive_test/coco/annotations/instances_val2017.json",
+        transform=transform,
+    )
+
+    # Reduce training dataset to 10%
+    train_indices = list(range(len(train_dataset)))
+    random.shuffle(train_indices)
+    subset_size = int(0.1 * len(train_indices))
+    train_subset = Subset(train_dataset, train_indices[:subset_size])
+
+    train_loader = DataLoader(
+        train_subset,
+        batch_size=2,
+        shuffle=True,
+        num_workers=4,
+        collate_fn=lambda x: tuple(zip(*x)),
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=2,
+        shuffle=False,
+        num_workers=4,
+        collate_fn=lambda x: tuple(zip(*x)),
+    )
+
+    # Step 2: Load pre-trained Faster R-CNN with FPN model
+    model = fasterrcnn_resnet50_fpn(pretrained=False)
+
+    # Replace the classification head to match the number of COCO classes
+    num_classes = 91  # 80 classes + background + other special classes
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = (
+        torchvision.models.detection.faster_rcnn.FastRCNNPredictor(in_features, num_classes)
+    )
+
+    # Load the pre-trained weights
+    pretrained_weights = torch.load("./output/20241225_212615/model_final.pth")
+    model.load_state_dict(pretrained_weights, strict=False)
+
+    # Step 3: Define the optimizer and learning rate scheduler
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0005)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
+
+    # Step 4: Training loop
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    model.to(device)
+
+
+    for i in range(0, 100):
+        print("Epoch", i)
+        train(model, train_loader, device)
+        evaluate(model, val_loader, device)
