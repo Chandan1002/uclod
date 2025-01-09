@@ -1,4 +1,7 @@
+import logging
+import os
 import random
+from datetime import datetime
 
 import torch
 import torchvision
@@ -8,6 +11,9 @@ from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CocoDetection
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
+from tqdm import tqdm
+
+from metrics import MetricsLogger, PerformanceMetrics
 
 
 class CustomCocoDetection(CocoDetection):
@@ -61,99 +67,229 @@ def move_to_device(obj, device):
         return obj  # If not a tensor, return as is
 
 
+def setup_logger(output_dir, rank):
+    """Setup logging configuration"""
+    logging.basicConfig(
+        level=logging.INFO if rank == 0 else logging.WARNING,
+        format="%(asctime)s %(levelname)s: %(message)s",
+        handlers=[
+            logging.FileHandler(os.path.join(output_dir, "train.log")),
+            logging.StreamHandler(),
+        ],
+    )
+    return logging.getLogger("train")
 
 
-def train(model, dataloader, device):
-    num_epochs = 1
-    model.train()
-    for epoch in range(0, num_epochs):
-        epoch_loss = 0
-        for images, targets in dataloader:
-            # Move images to device
-            images = [image.to(device) for image in images]
+def train(model, train_loader, val_loader, device, cfg):
+    """Training function with metrics logging and per-epoch evaluation"""
+    # Setup logging and metrics
+    logger = setup_logger(cfg["OUTPUT"]["DIR"], rank=0)
+    metrics_logger = MetricsLogger(cfg["OUTPUT"]["DIR"], distributed=False)
+    performance_metrics = PerformanceMetrics(model, metrics_logger)
 
-            # Move each target dictionary in the list to the device
-            targets = move_to_device(targets, device)
+    num_epochs = cfg["SOLVER"]["EPOCHS"]
+    log_period = cfg["OUTPUT"]["LOG_PERIOD"]
 
-            optimizer.zero_grad()
-            loss_dict = model(images, targets)
-            losses = sum(loss for loss in loss_dict.values())
-            losses.backward()
-            optimizer.step()
+    try:
+        for epoch in range(num_epochs):
+            # Training phase
+            model.train()
+            epoch_metrics = {
+                "loss": 0.0,
+                "loss_classifier": 0.0,
+                "loss_box_reg": 0.0,
+                "loss_objectness": 0.0,
+                "loss_rpn_box_reg": 0.0,
+            }
+            num_batches = 0
 
-            epoch_loss += losses.item()
-            print("step loss", losses.item())
+            pbar = tqdm(total=len(train_loader), desc=f"Epoch {epoch}/{num_epochs}")
 
-        lr_scheduler.step()
-        print(f"Epoch {epoch + 1}, Loss: {epoch_loss/len(dataloader)}")
+            for batch_idx, (images, targets) in enumerate(train_loader):
+                # Move data to device
+                images = [image.to(device) for image in images]
+                targets = move_to_device(targets, device)
+
+                # Training step
+                optimizer.zero_grad()
+                loss_dict = model(images, targets)
+                losses = sum(loss for loss in loss_dict.values())
+                losses.backward()
+                optimizer.step()
+
+                # Update metrics
+                global_iter = epoch * len(train_loader) + batch_idx
+
+                # Accumulate losses for epoch metrics
+                epoch_metrics["loss"] += losses.item()
+                for k, v in loss_dict.items():
+                    epoch_metrics[k] += v.item()
+                num_batches += 1
+
+                # Log metrics periodically
+                if batch_idx % log_period == 0:
+                    lr = optimizer.param_groups[0]["lr"]
+                    metrics = {
+                        "loss": losses.item(),
+                        "lr": lr,
+                        "epoch": epoch,
+                        **{k: v.item() for k, v in loss_dict.items()},
+                    }
+
+                    performance_metrics.update(
+                        metrics, global_iter, lr, log_to_console=True
+                    )
+                    performance_metrics.log_gpu_stats(global_iter)
+
+                    logger.info(
+                        f"Epoch {epoch} [{batch_idx}/{len(train_loader)}] - "
+                        f"Loss: {losses.item():.4f}, LR: {lr:.6f}"
+                    )
+
+                pbar.update(1)
+
+            pbar.close()
+
+            # End of epoch logging
+            lr_scheduler.step()
+
+            # Calculate epoch averages
+            epoch_avg_metrics = {
+                f"epoch_{k}": v / num_batches for k, v in epoch_metrics.items()
+            }
+            epoch_avg_metrics["epoch"] = epoch
+            epoch_avg_metrics["lr"] = optimizer.param_groups[0]["lr"]
+
+            # Log epoch metrics
+            performance_metrics.update_epoch(
+                epoch_avg_metrics, epoch, log_to_console=True
+            )
+
+            logger.info(f"\nEpoch {epoch} Summary:")
+            for k, v in epoch_avg_metrics.items():
+                logger.info(f"  {k}: {(v/len(train_loader)):.4f}")
+
+            # Evaluation phase
+            logger.info(f"Running evaluation for epoch {epoch}")
+            eval_metrics = evaluate(model, val_loader, device, cfg)
+
+            # Log evaluation metrics for this epoch
+            eval_epoch_metrics = {f"eval_{k}": v for k, v in eval_metrics.items()}
+            eval_epoch_metrics["epoch"] = epoch
+            performance_metrics.update_epoch(
+                eval_epoch_metrics, epoch, log_to_console=True
+            )
+
+            # Save checkpoint after each epoch
+            checkpoint_path = os.path.join(
+                cfg["OUTPUT"]["DIR"], f"model_epoch_{epoch:03d}.pth"
+            )
+            torch.save(model.state_dict(), checkpoint_path)
+
+    except Exception as e:
+        logger.error(f"Error during training: {str(e)}")
+        raise e
+    finally:
+        metrics_logger.close()
 
 
-# Step 5: Evaluation
-def evaluate(model, dataloader, device):
+def evaluate(model, dataloader, device, cfg):
+    """Evaluation function with metrics logging"""
+    logger = setup_logger(cfg["OUTPUT"]["DIR"], rank=0)
+    # metrics_logger = MetricsLogger(cfg["OUTPUT"]["DIR"], distributed=False)
+
     model.eval()
     all_predictions = []
-    all_targets = []
 
-    with torch.no_grad():
-        for images, targets in dataloader:
-            print("going over batch")
-            # Move images and targets to the device
-            images = [img.to(device) for img in images]
-            targets = move_to_device(targets, device)
+    try:
+        with torch.no_grad():
+            for images, targets in tqdm(dataloader, desc="Evaluating"):
+                images = [img.to(device) for img in images]
+                targets = move_to_device(targets, device)
+                outputs = model(images)
 
-            # Get model predictions
-            outputs = model(images)
+                for i, output in enumerate(outputs):
+                    image_id = targets[i]["image_id"].item()
+                    for box, label, score in zip(
+                        output["boxes"].cpu().numpy(),
+                        output["labels"].cpu().numpy(),
+                        output["scores"].cpu().numpy(),
+                    ):
+                        prediction = {
+                            "image_id": image_id,
+                            "category_id": int(label),
+                            "bbox": [
+                                float(box[0]),
+                                float(box[1]),
+                                float(box[2] - box[0]),
+                                float(box[3] - box[1]),
+                            ],
+                            "score": float(score),
+                        }
+                        all_predictions.append(prediction)
 
-            # Process outputs and targets for COCO evaluation
-            for i, output in enumerate(outputs):
-                image_id = targets[i]["image_id"].item()
-                for box, label, score in zip(
-                    output["boxes"].cpu().numpy(),
-                    output["labels"].cpu().numpy(),
-                    output["scores"].cpu().numpy(),
-                ):
-                    prediction = {
-                        "image_id": image_id,  # Include image_id
-                        "category_id": int(label),  # COCO category ID
-                        "bbox": [
-                            float(box[0]),  # x_min
-                            float(box[1]),  # y_min
-                            float(box[2] - box[0]),  # width
-                            float(box[3] - box[1]),  # height
-                        ],
-                        "score": float(score),  # Confidence score
-                    }
-                    all_predictions.append(prediction)
 
-    # Validate image IDs
-    # print("Prediction image_ids:", set([p["image_id"] for p in all_predictions]))
-    # print("Ground truth image_ids:", set(val_dataset.coco.getImgIds()))
+        print("Prediction image_ids:", set([p["image_id"] for p in all_predictions]))
+        # print("Ground truth image_ids:", set(val_dataset.coco.getImgIds()))
 
-    if len(set([p["image_id"] for p in all_predictions])) == 0:
-        print("Did not worked")
-        return
+        if len(set([p["image_id"] for p in all_predictions])) == 0:
+            logger.info("Did not worked")
+            return {}
 
-    # Filter out predictions with invalid image_ids
-    valid_img_ids = set(val_dataset.coco.getImgIds())
-    all_predictions = [p for p in all_predictions if p["image_id"] in valid_img_ids]
+        # COCO evaluation
+        coco_gt = val_dataset.coco
+        coco_dt = coco_gt.loadRes(all_predictions)
+        coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
+        coco_eval.evaluate()
+        coco_eval.accumulate()
+        coco_eval.summarize()
 
-    # Load ground truth and predictions into COCO API format
-    coco_gt = val_dataset.coco  # Use the COCO object from the dataset
-    coco_dt = coco_gt.loadRes(all_predictions)
+        # Log COCO metrics
+        eval_metrics = {
+            "AP": coco_eval.stats[0],  # AP at IoU=0.50:0.95
+            "AP50": coco_eval.stats[1],  # AP at IoU=0.50
+            "AP75": coco_eval.stats[2],  # AP at IoU=0.75
+            "AP_small": coco_eval.stats[3],  # AP for small objects
+            "AP_medium": coco_eval.stats[4],  # AP for medium objects
+            "AP_large": coco_eval.stats[5],  # AP for large objects
+        }
 
-    # Evaluate using COCOeval
-    coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
-    coco_eval.evaluate()
-    coco_eval.accumulate()
-    coco_eval.summarize()
+        # Log evaluation metrics
+        # metrics_logger.update(eval_metrics, 0)
+        logger.info("Evaluation Results:")
+        for k, v in eval_metrics.items():
+            logger.info(f"  {k}: {v:.4f}")
 
-    print(coco_eval.stats)
+        return eval_metrics
+
+    except Exception as e:
+        logger.error(f"Error during evaluation: {str(e)}")
+        raise e
 
 
 if __name__ == "__main__":
+    # Configuration dictionary similar to train.py
+    cfg = {
+        "OUTPUT": {
+            "DIR": os.path.join("output", datetime.now().strftime("%Y%m%d_%H%M%S")),
+            "LOG_PERIOD": 10,
+        },
+        "SOLVER": {
+            "EPOCHS": 100,
+            "BASE_LR": 0.001,
+        },
+        "SYSTEM": {"DEVICE": "cuda" if torch.cuda.is_available() else "cpu"},
+    }
+
+    # Create output directory
+    os.makedirs(cfg["OUTPUT"]["DIR"], exist_ok=True)
+
     # Step 1: Setup COCO dataset
     transform = T.Compose(
-        [T.ToTensor(), T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
+        [
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
     )
 
     train_dataset = CustomCocoDetection(
@@ -170,12 +306,13 @@ if __name__ == "__main__":
 
     # Reduce training dataset to 10%
     train_indices = list(range(len(train_dataset)))
-    random.shuffle(train_indices)
-    subset_size = int(0.1 * len(train_indices))
-    train_subset = Subset(train_dataset, train_indices[:subset_size])
+    # TODO: do something to make this dynamic
+    # random.shuffle(train_indices)
+    # subset_size = int(0.1 * len(train_indices))
+    # train_subset = Subset(train_dataset, train_indices[:subset_size])
 
     train_loader = DataLoader(
-        train_subset,
+        train_dataset,
         batch_size=2,
         shuffle=True,
         num_workers=4,
@@ -196,7 +333,9 @@ if __name__ == "__main__":
     num_classes = 91  # 80 classes + background + other special classes
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = (
-        torchvision.models.detection.faster_rcnn.FastRCNNPredictor(in_features, num_classes)
+        torchvision.models.detection.faster_rcnn.FastRCNNPredictor(
+            in_features, num_classes
+        )
     )
 
     # Load the pre-trained weights
@@ -207,12 +346,11 @@ if __name__ == "__main__":
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0005)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
 
-    # Step 4: Training loop
+    # Step 4: Training and evaluation
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model.to(device)
 
+    # Train the model with validation loader for per-epoch evaluation
+    train(model, train_loader, val_loader, device, cfg)
 
-    for i in range(0, 100):
-        print("Epoch", i)
-        train(model, train_loader, device)
-        evaluate(model, val_loader, device)
+    # TODO: save checkpoint
