@@ -15,11 +15,41 @@ from tqdm import tqdm
 
 from metrics import MetricsLogger, PerformanceMetrics
 
+# class CustomCocoDetection(CocoDetection):
+#     def __getitem__(self, idx):
+#         img, target = super().__getitem__(idx)
+#
+#         # Extract bounding boxes and labels
+#         boxes = [obj["bbox"] for obj in target]
+#         labels = [obj["category_id"] for obj in target]
+#
+#         if len(boxes) == 0:  # Handle images with no objects
+#             boxes = torch.zeros((0, 4), dtype=torch.float32)
+#             labels = torch.zeros((0,), dtype=torch.int64)
+#         else:
+#             # Convert to tensors
+#             boxes = torch.tensor(boxes, dtype=torch.float32)
+#             labels = torch.tensor(labels, dtype=torch.int64)
+#
+#             # Convert [x, y, width, height] to [x_min, y_min, x_max, y_max]
+#             boxes[:, 2:] += boxes[:, :2]  # Convert width/height to max coords
+#
+#             # Filter out invalid boxes (width or height <= 0)
+#             valid_indices = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+#             boxes = boxes[valid_indices]
+#             labels = labels[valid_indices]
+#
+#         target = {"boxes": boxes, "labels": labels, "image_id": torch.tensor([idx])}
+#         return img, target
+
 
 class CustomCocoDetection(CocoDetection):
     def __getitem__(self, idx):
         img, target = super().__getitem__(idx)
-
+        
+        # Get the actual COCO image ID from the original annotation
+        image_id = self.ids[idx]  # This gets the actual COCO image ID
+        
         # Extract bounding boxes and labels
         boxes = [obj["bbox"] for obj in target]
         labels = [obj["category_id"] for obj in target]
@@ -40,9 +70,12 @@ class CustomCocoDetection(CocoDetection):
             boxes = boxes[valid_indices]
             labels = labels[valid_indices]
 
-        target = {"boxes": boxes, "labels": labels, "image_id": torch.tensor([idx])}
+        target = {
+            "boxes": boxes,
+            "labels": labels,
+            "image_id": torch.tensor([image_id])  # Use actual COCO image ID
+        }
         return img, target
-
 
 def move_to_device(obj, device):
     """
@@ -80,7 +113,7 @@ def setup_logger(output_dir, rank):
     return logging.getLogger("train")
 
 
-def train(model, train_loader, val_loader, device, cfg):
+def train(model, train_loader, val_set, device, cfg):
     """Training function with metrics logging and per-epoch evaluation"""
     # Setup logging and metrics
     logger = setup_logger(cfg["OUTPUT"]["DIR"], rank=0)
@@ -171,7 +204,7 @@ def train(model, train_loader, val_loader, device, cfg):
 
             # Evaluation phase
             logger.info(f"Running evaluation for epoch {epoch}")
-            eval_metrics = evaluate(model, val_loader, device, cfg)
+            eval_metrics = evaluate(model, val_set, device, cfg)
 
             # Log evaluation metrics for this epoch
             eval_epoch_metrics = {f"eval_{k}": v for k, v in eval_metrics.items()}
@@ -193,21 +226,19 @@ def train(model, train_loader, val_loader, device, cfg):
         metrics_logger.close()
 
 
-def evaluate(model, dataloader, device, cfg):
+def evaluate(model, dataset, device, cfg):
     """Evaluation function with metrics logging"""
     logger = setup_logger(cfg["OUTPUT"]["DIR"], rank=0)
     # metrics_logger = MetricsLogger(cfg["OUTPUT"]["DIR"], distributed=False)
 
     model.eval()
     all_predictions = []
-
     try:
         with torch.no_grad():
-            for images, targets in tqdm(dataloader, desc="Evaluating"):
+            for images, targets in tqdm(dataset, desc="Evaluating"):
                 images = [img.to(device) for img in images]
                 targets = move_to_device(targets, device)
                 outputs = model(images)
-
                 for i, output in enumerate(outputs):
                     image_id = targets[i]["image_id"].item()
                     for box, label, score in zip(
@@ -228,13 +259,16 @@ def evaluate(model, dataloader, device, cfg):
                         }
                         all_predictions.append(prediction)
 
+        if len(set([p["image_id"] for p in all_predictions])) == 0:
+            logger.info("Did not worked")
 
         print("Prediction image_ids:", set([p["image_id"] for p in all_predictions]))
-        # print("Ground truth image_ids:", set(val_dataset.coco.getImgIds()))
+        print("Ground truth image_ids:", set(val_dataset.coco.getImgIds()))
 
         if len(set([p["image_id"] for p in all_predictions])) == 0:
             logger.info("Did not worked")
             return {}
+
 
         # COCO evaluation
         coco_gt = val_dataset.coco
@@ -306,13 +340,12 @@ if __name__ == "__main__":
 
     # Reduce training dataset to 10%
     train_indices = list(range(len(train_dataset)))
-    # TODO: do something to make this dynamic
-    # random.shuffle(train_indices)
-    # subset_size = int(0.1 * len(train_indices))
-    # train_subset = Subset(train_dataset, train_indices[:subset_size])
+    random.shuffle(train_indices)
+    subset_size = int(0.1 * len(train_indices))
+    train_subset = Subset(train_dataset, train_indices[:subset_size])
 
     train_loader = DataLoader(
-        train_dataset,
+        train_subset,
         batch_size=2,
         shuffle=True,
         num_workers=4,
@@ -330,7 +363,7 @@ if __name__ == "__main__":
     model = fasterrcnn_resnet50_fpn(pretrained=False)
 
     # Replace the classification head to match the number of COCO classes
-    num_classes = 91  # 80 classes + background + other special classes
+    num_classes = 80  # 80 classes + background + other special classes
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = (
         torchvision.models.detection.faster_rcnn.FastRCNNPredictor(
@@ -352,5 +385,6 @@ if __name__ == "__main__":
 
     # Train the model with validation loader for per-epoch evaluation
     train(model, train_loader, val_loader, device, cfg)
+    # evaluate(model, val_loader, device, cfg)
 
     # TODO: save checkpoint
