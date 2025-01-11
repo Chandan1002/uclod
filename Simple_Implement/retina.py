@@ -6,6 +6,7 @@ from datetime import datetime
 import torch
 import torchvision
 import torchvision.transforms as T
+import yaml
 from pycocotools.cocoeval import COCOeval
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CocoDetection
@@ -14,6 +15,13 @@ from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 from tqdm import tqdm
 
 from metrics import MetricsLogger, PerformanceMetrics
+from model import UnsupervisedDetector
+
+
+def load_config(config_file):
+    """Load YAML configuration file"""
+    with open(config_file, "r") as f:
+        return yaml.safe_load(f)
 
 
 class CustomCocoDetection(CocoDetection):
@@ -40,7 +48,6 @@ class CustomCocoDetection(CocoDetection):
 
             self.coco_to_continuous_category_id[coco_id] = continuous_id
             self.continuous_category_id_to_coco[continuous_id] = coco_id
-
 
     def __getitem__(self, idx):
         img, target = super().__getitem__(idx)
@@ -213,9 +220,7 @@ def train(model, train_loader, val_set, device, cfg):
             # Log evaluation metrics for this epoch
             eval_epoch_metrics = {f"eval_{k}": v for k, v in eval_metrics.items()}
             eval_epoch_metrics["epoch"] = epoch
-            performance_metrics.update(
-                eval_epoch_metrics, epoch, log_to_console=True
-            )
+            performance_metrics.update(eval_epoch_metrics, epoch, log_to_console=True)
 
             # Save checkpoint after each epoch
             checkpoint_path = os.path.join(
@@ -321,6 +326,7 @@ if __name__ == "__main__":
             "BASE_LR": 0.001,
         },
         "SYSTEM": {"DEVICE": "cuda" if torch.cuda.is_available() else "cpu"},
+        "LOAD": {"PATH": "./output/20250111_145054", "MODEL": "model_epoch_000_iter_0000000.pth"},
     }
 
     # Create output directory
@@ -372,19 +378,25 @@ if __name__ == "__main__":
     )
 
     # Step 2: Load pre-trained Faster R-CNN with FPN model
-    # model = fasterrcnn_resnet50_fpn(pretrained=False)
-    backbone = resnet_fpn_backbone(
-        backbone_name=cfg["MODEL"]["BACKBONE"]["NAME"],
-        pretrained=False,
-        trainable_layers=5,
-    )
-    model = FasterRCNN(backbone, num_classes=len(train_dataset.continuous_category_id_to_coco) + 1)
+    if cfg["LOAD"]["PATH"] != "":
+        backbone = UnsupervisedDetector(
+            load_config(cfg["LOAD"]["PATH"] + "/config.yaml")
+        )
+        pretrained_weights = torch.load(
+            cfg["LOAD"]["PATH"] + "/" + cfg["LOAD"]["MODEL"]
+        )
+        backbone.load_state_dict(pretrained_weights, strict=False)
+        backbone = backbone.pipeline2.fpn
+    else:
+        backbone = resnet_fpn_backbone(
+            backbone_name=cfg["MODEL"]["BACKBONE"]["NAME"],
+            pretrained=False,
+            trainable_layers=5,
+        )
 
-    # Load the pre-trained weights
-    # pretrained_weights = torch.load(
-    #     "/home/ecx/ml/Simple_implementation/output/20241231_142448/model_epoch_339_final.pth"
-    # )
-    # model.load_state_dict(pretrained_weights, strict=False)
+    model = FasterRCNN(
+        backbone, num_classes=len(train_dataset.continuous_category_id_to_coco) + 1
+    )
 
     # Step 3: Define the optimizer and learning rate scheduler
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0005)
