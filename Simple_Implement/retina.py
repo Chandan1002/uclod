@@ -9,6 +9,7 @@ import torchvision.transforms as T
 from pycocotools.cocoeval import COCOeval
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CocoDetection
+from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 from tqdm import tqdm
 
@@ -40,7 +41,6 @@ class CustomCocoDetection(CocoDetection):
             self.coco_to_continuous_category_id[coco_id] = continuous_id
             self.continuous_category_id_to_coco[continuous_id] = coco_id
 
-            print(f"COCO ID {coco_id} -> Continuous ID {continuous_id} ({cat['name']})")
 
     def __getitem__(self, idx):
         img, target = super().__getitem__(idx)
@@ -50,16 +50,12 @@ class CustomCocoDetection(CocoDetection):
         boxes = []
         labels = []
 
-        print(f"\nProcessing image {image_id}:")
         for obj in target:
             category_id = obj["category_id"]
             if category_id in self.coco_to_continuous_category_id:
                 boxes.append(obj["bbox"])
                 continuous_id = self.coco_to_continuous_category_id[category_id]
                 labels.append(continuous_id)
-                print(f"  COCO category {category_id} -> continuous ID {continuous_id}")
-            else:
-                print(f"  WARNING: Skipping unknown category ID {category_id}")
 
         if len(boxes) == 0:  # Handle images with no objects
             boxes = torch.zeros((0, 4), dtype=torch.float32)
@@ -151,44 +147,8 @@ def train(model, train_loader, val_set, device, cfg):
                 images = [image.to(device) for image in images]
                 targets = move_to_device(targets, device)
 
-                # # Training step
-                # optimizer.zero_grad()
-                # loss_dict = model(images, targets)
-                # losses = sum(loss for loss in loss_dict.values())
-                # losses.backward()
-                # optimizer.step()
                 # Training step
                 optimizer.zero_grad()
-
-                # Debug prints
-                for idx, target in enumerate(targets):
-                    print(f"\nBatch item {idx}:")
-                    print(f"Labels: {target['labels']}")
-                    print(f"Boxes shape: {target['boxes'].shape}")
-                    print(f"Labels shape: {target['labels'].shape}")
-                    print(f"Image ID: {target['image_id']}")
-
-                    # Validate label values
-                    if len(target["labels"]) > 0:
-                        print(f"Min label: {target['labels'].min()}")
-                        print(f"Max label: {target['labels'].max()}")
-
-                    # Validate box coordinates
-                    if len(target["boxes"]) > 0:
-                        print(f"Box coordinate ranges:")
-                        print(
-                            f"x_min: {target['boxes'][:, 0].min():.2f} to {target['boxes'][:, 0].max():.2f}"
-                        )
-                        print(
-                            f"y_min: {target['boxes'][:, 1].min():.2f} to {target['boxes'][:, 1].max():.2f}"
-                        )
-                        print(
-                            f"x_max: {target['boxes'][:, 2].min():.2f} to {target['boxes'][:, 2].max():.2f}"
-                        )
-                        print(
-                            f"y_max: {target['boxes'][:, 3].min():.2f} to {target['boxes'][:, 3].max():.2f}"
-                        )
-
                 loss_dict = model(images, targets)
                 losses = sum(loss for loss in loss_dict.values())
                 losses.backward()
@@ -352,11 +312,11 @@ if __name__ == "__main__":
             "LOG_PERIOD": 10,
         },
         "MODEL": {
-                "BACKBONE": {
-                    "NAME": 'resnet50',
-                    "FREEZE_AT": 2,
-                }
-            },
+            "BACKBONE": {
+                "NAME": "resnet50",
+                "FREEZE_AT": 2,
+            }
+        },
         "SOLVER": {
             "EPOCHS": 100,
             "BASE_LR": 0.001,
@@ -413,20 +373,12 @@ if __name__ == "__main__":
 
     # Step 2: Load pre-trained Faster R-CNN with FPN model
     # model = fasterrcnn_resnet50_fpn(pretrained=False)
-    model = resnet_fpn_backbone(
+    backbone = resnet_fpn_backbone(
         backbone_name=cfg["MODEL"]["BACKBONE"]["NAME"],
         pretrained=False,
         trainable_layers=5,
     )
-
-    # Replace the classification head to match the number of COCO classes
-    # num_classes = 80  # 80 classes + background + other special classes
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = (
-        torchvision.models.detection.faster_rcnn.FastRCNNPredictor(
-            in_features, num_classes
-        )
-    )
+    model = FasterRCNN(backbone, num_classes=len(train_dataset.continuous_category_id_to_coco) + 1)
 
     # Load the pre-trained weights
     # pretrained_weights = torch.load(
@@ -444,6 +396,3 @@ if __name__ == "__main__":
 
     # Train the model with validation loader for per-epoch evaluation
     train(model, train_loader, val_loader, device, cfg)
-    # evaluate(model, val_loader, device, cfg)
-
-    # TODO: save checkpoint
