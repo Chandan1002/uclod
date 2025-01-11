@@ -15,33 +15,6 @@ from tqdm import tqdm
 
 from metrics import MetricsLogger, PerformanceMetrics
 
-# class CustomCocoDetection(CocoDetection):
-#     def __getitem__(self, idx):
-#         img, target = super().__getitem__(idx)
-#
-#         # Extract bounding boxes and labels
-#         boxes = [obj["bbox"] for obj in target]
-#         labels = [obj["category_id"] for obj in target]
-#
-#         if len(boxes) == 0:  # Handle images with no objects
-#             boxes = torch.zeros((0, 4), dtype=torch.float32)
-#             labels = torch.zeros((0,), dtype=torch.int64)
-#         else:
-#             # Convert to tensors
-#             boxes = torch.tensor(boxes, dtype=torch.float32)
-#             labels = torch.tensor(labels, dtype=torch.int64)
-#
-#             # Convert [x, y, width, height] to [x_min, y_min, x_max, y_max]
-#             boxes[:, 2:] += boxes[:, :2]  # Convert width/height to max coords
-#
-#             # Filter out invalid boxes (width or height <= 0)
-#             valid_indices = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
-#             boxes = boxes[valid_indices]
-#             labels = labels[valid_indices]
-#
-#         target = {"boxes": boxes, "labels": labels, "image_id": torch.tensor([idx])}
-#         return img, target
-
 
 class CustomCocoDetection(CocoDetection):
     def __getitem__(self, idx):
@@ -343,7 +316,7 @@ if __name__ == "__main__":
     train_subset = Subset(train_dataset, train_indices[:subset_size])
 
     train_loader = DataLoader(
-        train_dataset,
+        train_subset,
         batch_size=2,
         shuffle=True,
         num_workers=4,
