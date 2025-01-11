@@ -221,25 +221,25 @@ def train(model, train_loader, val_set, device, cfg):
                 optimizer.zero_grad()
                 
                 # Debug prints
-                for idx, target in enumerate(targets):
-                    print(f"\nBatch item {idx}:")
-                    print(f"Labels: {target['labels']}")
-                    print(f"Boxes shape: {target['boxes'].shape}")
-                    print(f"Labels shape: {target['labels'].shape}")
-                    print(f"Image ID: {target['image_id']}")
-                    
-                    # Validate label values
-                    if len(target['labels']) > 0:
-                        print(f"Min label: {target['labels'].min()}")
-                        print(f"Max label: {target['labels'].max()}")
-                        
-                    # Validate box coordinates
-                    if len(target['boxes']) > 0:
-                        print(f"Box coordinate ranges:")
-                        print(f"x_min: {target['boxes'][:, 0].min():.2f} to {target['boxes'][:, 0].max():.2f}")
-                        print(f"y_min: {target['boxes'][:, 1].min():.2f} to {target['boxes'][:, 1].max():.2f}")
-                        print(f"x_max: {target['boxes'][:, 2].min():.2f} to {target['boxes'][:, 2].max():.2f}")
-                        print(f"y_max: {target['boxes'][:, 3].min():.2f} to {target['boxes'][:, 3].max():.2f}")
+                # for idx, target in enumerate(targets):
+                #     print(f"\nBatch item {idx}:")
+                #     print(f"Labels: {target['labels']}")
+                #     print(f"Boxes shape: {target['boxes'].shape}")
+                #     print(f"Labels shape: {target['labels'].shape}")
+                #     print(f"Image ID: {target['image_id']}")
+                #     
+                #     # Validate label values
+                #     if len(target['labels']) > 0:
+                #         print(f"Min label: {target['labels'].min()}")
+                #         print(f"Max label: {target['labels'].max()}")
+                #         
+                #     # Validate box coordinates
+                #     if len(target['boxes']) > 0:
+                #         print(f"Box coordinate ranges:")
+                #         print(f"x_min: {target['boxes'][:, 0].min():.2f} to {target['boxes'][:, 0].max():.2f}")
+                #         print(f"y_min: {target['boxes'][:, 1].min():.2f} to {target['boxes'][:, 1].max():.2f}")
+                #         print(f"x_max: {target['boxes'][:, 2].min():.2f} to {target['boxes'][:, 2].max():.2f}")
+                #         print(f"y_max: {target['boxes'][:, 3].min():.2f} to {target['boxes'][:, 3].max():.2f}")
                 
                 loss_dict = model(images, targets)
                 losses = sum(loss for loss in loss_dict.values())
@@ -305,7 +305,7 @@ def train(model, train_loader, val_set, device, cfg):
             # Log evaluation metrics for this epoch
             eval_epoch_metrics = {f"eval_{k}": v for k, v in eval_metrics.items()}
             eval_epoch_metrics["epoch"] = epoch
-            performance_metrics.update_epoch(
+            performance_metrics.update(
                 eval_epoch_metrics, epoch, log_to_console=True
             )
 
@@ -423,14 +423,14 @@ if __name__ == "__main__":
     )
 
     train_dataset = CustomCocoDetection(
-        root="/home/data/ecx/coco/train2017",
-        annFile="/home/data/ecx/coco/annotations/instances_train2017.json",
+        root="/mnt/drive_test/coco/train2017",
+        annFile="/mnt/drive_test/coco/annotations/instances_train2017.json",
         transform=transform,
     )
 
     val_dataset = CustomCocoDetection(
-        root="/home/data/ecx/coco/val2017",
-        annFile="/home/data/ecx/coco/annotations/instances_val2017.json",
+        root="/mnt/drive_test/coco/val2017",
+        annFile="/mnt/drive_test/coco/annotations/instances_val2017.json",
         transform=transform,
     )
 
@@ -471,8 +471,8 @@ if __name__ == "__main__":
     )
 
     # Load the pre-trained weights
-    pretrained_weights = torch.load("/home/ecx/ml/Simple_implementation/output/20241231_142448/model_epoch_339_final.pth")
-    model.load_state_dict(pretrained_weights, strict=False)
+    # pretrained_weights = torch.load("/home/ecx/ml/Simple_implementation/output/20241231_142448/model_epoch_339_final.pth")
+    # model.load_state_dict(pretrained_weights, strict=False)
 
     # Step 3: Define the optimizer and learning rate scheduler
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0005)
@@ -485,5 +485,3 @@ if __name__ == "__main__":
     # Train the model with validation loader for per-epoch evaluation
     train(model, train_loader, val_loader, device, cfg)
     # evaluate(model, val_loader, device, cfg)
-
-    # TODO: save checkpoint

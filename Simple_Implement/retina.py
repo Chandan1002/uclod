@@ -213,7 +213,7 @@ def train(model, train_loader, val_set, device, cfg):
             # Log evaluation metrics for this epoch
             eval_epoch_metrics = {f"eval_{k}": v for k, v in eval_metrics.items()}
             eval_epoch_metrics["epoch"] = epoch
-            performance_metrics.update_epoch(
+            performance_metrics.update(
                 eval_epoch_metrics, epoch, log_to_console=True
             )
 
@@ -233,7 +233,6 @@ def train(model, train_loader, val_set, device, cfg):
 def evaluate(model, dataset, device, cfg):
     """Evaluation function with metrics logging"""
     logger = setup_logger(cfg["OUTPUT"]["DIR"], rank=0)
-    # metrics_logger = MetricsLogger(cfg["OUTPUT"]["DIR"], distributed=False)
 
     model.eval()
     all_predictions = []
@@ -354,6 +353,7 @@ if __name__ == "__main__":
     train_indices = list(range(len(train_dataset)))
     random.shuffle(train_indices)
     subset_size = int(0.1 * len(train_indices))
+
     train_subset = Subset(train_dataset, train_indices[:subset_size])
 
     train_loader = DataLoader(
