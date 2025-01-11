@@ -24,6 +24,35 @@ def load_config(config_file):
         return yaml.safe_load(f)
 
 
+def load_model_retina(cfg):
+    if cfg["LOAD"]["PATH"] != "":
+        path = cfg["LOAD"]["PATH"]
+        if cfg["LOAD"]["SUPERVISED"] != "":
+            print("Loading supervised")
+            backbone = resnet_fpn_backbone(
+                backbone_name=cfg["MODEL"]["BACKBONE"]["NAME"],
+                pretrained=False,
+                trainable_layers=5,
+            )
+            pretrained_weights = torch.load(path + "/" + cfg["LOAD"]["SUPERVISED"])
+            backbone.load_state_dict(pretrained_weights, strict=False)
+
+        elif cfg["LOAD"]["UNSUPERVISED"] != "":
+            print("Loading unsupervised")
+            backbone = UnsupervisedDetector(load_config(path + "/" + "config.yaml"))
+            pretrained_weights = torch.load(path + "/" + cfg["LOAD"]["UNSUPERVISED"])
+            backbone.load_state_dict(pretrained_weights, strict=False)
+            backbone = backbone.pipeline2.fpn
+    else:
+        print("Using raw model")
+        backbone = resnet_fpn_backbone(
+            backbone_name=cfg["MODEL"]["BACKBONE"]["NAME"],
+            pretrained=False,
+            trainable_layers=5,
+        )
+
+    return backbone
+
 class CustomCocoDetection(CocoDetection):
     def __init__(self, root, annFile, transform=None):
         super().__init__(root, annFile, transform)
@@ -326,7 +355,11 @@ if __name__ == "__main__":
             "BASE_LR": 0.001,
         },
         "SYSTEM": {"DEVICE": "cuda" if torch.cuda.is_available() else "cpu"},
-        "LOAD": {"PATH": "./output/20250111_145054", "MODEL": "model_epoch_000_iter_0000000.pth"},
+        "LOAD": {
+            "PATH": "",
+            "UNSUPERVISED": "",
+            "SUPERVISED": "",
+        },
     }
 
     # Create output directory
@@ -378,21 +411,7 @@ if __name__ == "__main__":
     )
 
     # Step 2: Load pre-trained Faster R-CNN with FPN model
-    if cfg["LOAD"]["PATH"] != "":
-        backbone = UnsupervisedDetector(
-            load_config(cfg["LOAD"]["PATH"] + "/config.yaml")
-        )
-        pretrained_weights = torch.load(
-            cfg["LOAD"]["PATH"] + "/" + cfg["LOAD"]["MODEL"]
-        )
-        backbone.load_state_dict(pretrained_weights, strict=False)
-        backbone = backbone.pipeline2.fpn
-    else:
-        backbone = resnet_fpn_backbone(
-            backbone_name=cfg["MODEL"]["BACKBONE"]["NAME"],
-            pretrained=False,
-            trainable_layers=5,
-        )
+    backbone = load_model_retina(cfg)
 
     model = FasterRCNN(
         backbone, num_classes=len(train_dataset.continuous_category_id_to_coco) + 1
