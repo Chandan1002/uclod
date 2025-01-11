@@ -101,7 +101,7 @@ class CustomCocoDetection(CocoDetection):
             self.coco_to_continuous_category_id[coco_id] = continuous_id
             self.continuous_category_id_to_coco[continuous_id] = coco_id
             
-            print(f"COCO ID {coco_id} -> Continuous ID {continuous_id} ({cat['name']})")
+            # print(f"COCO ID {coco_id} -> Continuous ID {continuous_id} ({cat['name']})")
             
     def __getitem__(self, idx):
         img, target = super().__getitem__(idx)
@@ -111,16 +111,16 @@ class CustomCocoDetection(CocoDetection):
         boxes = []
         labels = []
         
-        print(f"\nProcessing image {image_id}:")
+        # print(f"\nProcessing image {image_id}:")
         for obj in target:
             category_id = obj["category_id"]
             if category_id in self.coco_to_continuous_category_id:
                 boxes.append(obj["bbox"])
                 continuous_id = self.coco_to_continuous_category_id[category_id]
                 labels.append(continuous_id)
-                print(f"  COCO category {category_id} -> continuous ID {continuous_id}")
-            else:
-                print(f"  WARNING: Skipping unknown category ID {category_id}")
+            #     print(f"  COCO category {category_id} -> continuous ID {continuous_id}")
+            # else:
+            #     print(f"  WARNING: Skipping unknown category ID {category_id}")
 
         if len(boxes) == 0:  # Handle images with no objects
             boxes = torch.zeros((0, 4), dtype=torch.float32)
