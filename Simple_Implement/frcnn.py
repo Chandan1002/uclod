@@ -259,11 +259,9 @@ def evaluate(model, dataset, device, cfg):
                         }
                         all_predictions.append(prediction)
 
-        if len(set([p["image_id"] for p in all_predictions])) == 0:
-            logger.info("Did not worked")
 
-        print("Prediction image_ids:", set([p["image_id"] for p in all_predictions]))
-        print("Ground truth image_ids:", set(val_dataset.coco.getImgIds()))
+        # print("Prediction image_ids:", set([p["image_id"] for p in all_predictions]))
+        # print("Ground truth image_ids:", set(val_dataset.coco.getImgIds()))
 
         if len(set([p["image_id"] for p in all_predictions])) == 0:
             logger.info("Did not worked")
@@ -345,7 +343,7 @@ if __name__ == "__main__":
     train_subset = Subset(train_dataset, train_indices[:subset_size])
 
     train_loader = DataLoader(
-        train_subset,
+        train_dataset,
         batch_size=2,
         shuffle=True,
         num_workers=4,
@@ -363,7 +361,7 @@ if __name__ == "__main__":
     model = fasterrcnn_resnet50_fpn(pretrained=False)
 
     # Replace the classification head to match the number of COCO classes
-    num_classes = 80  # 80 classes + background + other special classes
+    num_classes = 91  # 80 classes + background + other special classes
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = (
         torchvision.models.detection.faster_rcnn.FastRCNNPredictor(
@@ -386,5 +384,3 @@ if __name__ == "__main__":
     # Train the model with validation loader for per-epoch evaluation
     train(model, train_loader, val_loader, device, cfg)
     # evaluate(model, val_loader, device, cfg)
-
-    # TODO: save checkpoint
