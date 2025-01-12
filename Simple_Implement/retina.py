@@ -4,11 +4,14 @@ import random
 from datetime import datetime
 
 import torch
+import torch.distributed as dist
 import torchvision
 import torchvision.transforms as T
 import yaml
 from pycocotools.cocoeval import COCOeval
+from torch.nn.parallel import DataParallel, DistributedDataParallel
 from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import CocoDetection
 from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
@@ -16,6 +19,17 @@ from tqdm import tqdm
 
 from metrics import MetricsLogger, PerformanceMetrics
 from model import UnsupervisedDetector
+
+
+def setup_distributed():
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+        torch.cuda.set_device(rank)
+        return rank, world_size
+    else:
+        return 0, 1
 
 
 def load_config(config_file):
@@ -53,6 +67,7 @@ def load_model_retina(cfg):
 
     return backbone
 
+
 class CustomCocoDetection(CocoDetection):
     def __init__(self, root, annFile, transform=None):
         super().__init__(root, annFile, transform)
@@ -86,12 +101,28 @@ class CustomCocoDetection(CocoDetection):
         boxes = []
         labels = []
 
-        for obj in target:
-            category_id = obj["category_id"]
-            if category_id in self.coco_to_continuous_category_id:
-                boxes.append(obj["bbox"])
-                continuous_id = self.coco_to_continuous_category_id[category_id]
-                labels.append(continuous_id)
+        # Use list comprehension for faster processing
+        boxes, labels = (
+            zip(
+                *[
+                    (
+                        obj["bbox"],
+                        self.coco_to_continuous_category_id[obj["category_id"]],
+                    )
+                    for obj in target
+                    if obj["category_id"] in self.coco_to_continuous_category_id
+                ]
+            )
+            if target
+            else ([], [])
+        )
+
+        # for obj in target:
+        #     category_id = obj["category_id"]
+        #     if category_id in self.coco_to_continuous_category_id:
+        #         boxes.append(obj["bbox"])
+        #         continuous_id = self.coco_to_continuous_category_id[category_id]
+        #         labels.append(continuous_id)
 
         if len(boxes) == 0:  # Handle images with no objects
             boxes = torch.zeros((0, 4), dtype=torch.float32)
@@ -188,6 +219,7 @@ def train(model, train_loader, val_set, device, cfg):
                 loss_dict = model(images, targets)
                 losses = sum(loss for loss in loss_dict.values())
                 losses.backward()
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
                 optimizer.step()
 
                 # Update metrics
@@ -209,10 +241,11 @@ def train(model, train_loader, val_set, device, cfg):
                         **{k: v.item() for k, v in loss_dict.items()},
                     }
 
-                    performance_metrics.update(
-                        metrics, global_iter, lr, log_to_console=True
-                    )
-                    performance_metrics.log_gpu_stats(global_iter)
+                    if global_iter != 0:
+                        performance_metrics.update(
+                            metrics, global_iter, lr, log_to_console=True
+                        )
+                        performance_metrics.log_gpu_stats(global_iter)
 
                     logger.info(
                         f"Epoch {epoch} [{batch_idx}/{len(train_loader)}] - "
@@ -365,6 +398,9 @@ if __name__ == "__main__":
     # Create output directory
     os.makedirs(cfg["OUTPUT"]["DIR"], exist_ok=True)
 
+    rank, world_size = setup_distributed()
+    is_distributed = world_size > 1
+
     # Step 1: Setup COCO dataset
     transform = T.Compose(
         [
@@ -395,12 +431,19 @@ if __name__ == "__main__":
 
     train_subset = Subset(train_dataset, train_indices[:subset_size])
 
+    # distibuted samplers
+    train_sampler = DistributedSampler(train_subset) if is_distributed else None
+    val_sampler = (
+        DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
+    )
+
     train_loader = DataLoader(
-        train_subset,
-        batch_size=2,
+        train_dataset,
+        batch_size=4,
         shuffle=True,
-        num_workers=4,
+        num_workers=2,
         collate_fn=lambda x: tuple(zip(*x)),
+        sampler=train_sampler,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -408,6 +451,7 @@ if __name__ == "__main__":
         shuffle=False,
         num_workers=4,
         collate_fn=lambda x: tuple(zip(*x)),
+        sampler=val_sampler,
     )
 
     # Step 2: Load pre-trained Faster R-CNN with FPN model
@@ -417,8 +461,13 @@ if __name__ == "__main__":
         backbone, num_classes=len(train_dataset.continuous_category_id_to_coco) + 1
     )
 
+    if is_distributed:
+        model = DistributedDataParallel(model, device_ids=[rank])
+    elif torch.cuda.device_count() > 1:
+        model = DataParallel(model)
+
     # Step 3: Define the optimizer and learning rate scheduler
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0005)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
 
     # Step 4: Training and evaluation
@@ -426,4 +475,8 @@ if __name__ == "__main__":
     model.to(device)
 
     # Train the model with validation loader for per-epoch evaluation
-    train(model, train_loader, val_loader, device, cfg)
+    try:
+        train(model, train_loader, val_loader, device, cfg)
+    finally:
+        if is_distributed:
+            dist.destroy_process_group()
