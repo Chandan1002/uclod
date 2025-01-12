@@ -377,7 +377,7 @@ if __name__ == "__main__":
         "SYSTEM": {"DEVICE": "cuda" if torch.cuda.is_available() else "cpu"},
         "LOAD": {
             "PATH": "./output/20250111_145054",
-            "UNSUPERVISED": "model_epoch_000_iter_0000000.pth",
+            "UNSUPERVISED": "",
             "SUPERVISED": "",
         },
     }
