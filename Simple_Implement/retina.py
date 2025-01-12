@@ -5,6 +5,7 @@ from datetime import datetime
 
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 import torchvision
 import torchvision.transforms as T
 import yaml
@@ -19,6 +20,10 @@ from tqdm import tqdm
 
 from metrics import MetricsLogger, PerformanceMetrics
 from model import UnsupervisedDetector
+
+
+def collate_fn(batch):
+    return tuple(zip(*batch))
 
 
 def setup_distributed():
@@ -184,26 +189,24 @@ def setup_logger(output_dir, rank):
     return logging.getLogger("train")
 
 
-def train(model, train_loader, val_set, cfg):
+def train(model, train_loader, val_loader, device, cfg, optimizer, lr_scheduler):
     """Training function with metrics logging and per-epoch evaluation"""
-    # Step 3: Define the optimizer and learning rate scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
+    # Setup logging and metrics (only on rank 0)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    logger = setup_logger(cfg["OUTPUT"]["DIR"], rank=rank)
 
-    # Step 4: Training and evaluation
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    model.to(device)
-
-    # Setup logging and metrics
-    logger = setup_logger(cfg["OUTPUT"]["DIR"], rank=0)
-    metrics_logger = MetricsLogger(cfg["OUTPUT"]["DIR"], distributed=False)
-    performance_metrics = PerformanceMetrics(model, metrics_logger)
+    if rank == 0:
+        metrics_logger = MetricsLogger(cfg["OUTPUT"]["DIR"], distributed=True)
+        performance_metrics = PerformanceMetrics(model, metrics_logger)
 
     num_epochs = cfg["SOLVER"]["EPOCHS"]
     log_period = cfg["OUTPUT"]["LOG_PERIOD"]
 
     try:
         for epoch in range(num_epochs):
+            # Set epoch for samplers
+            train_loader.sampler.set_epoch(epoch)
+
             # Training phase
             model.train()
             epoch_metrics = {
@@ -215,7 +218,8 @@ def train(model, train_loader, val_set, cfg):
             }
             num_batches = 0
 
-            pbar = tqdm(total=len(train_loader), desc=f"Epoch {epoch}/{num_epochs}")
+            if rank == 0:
+                pbar = tqdm(total=len(train_loader), desc=f"Epoch {epoch}/{num_epochs}")
 
             for batch_idx, (images, targets) in enumerate(train_loader):
                 # Move data to device
@@ -227,6 +231,7 @@ def train(model, train_loader, val_set, cfg):
                 loss_dict = model(images, targets)
                 losses = sum(loss for loss in loss_dict.values())
                 losses.backward()
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
                 optimizer.step()
 
                 # Update metrics
@@ -261,45 +266,45 @@ def train(model, train_loader, val_set, cfg):
 
                 pbar.update(1)
 
-            pbar.close()
+            if rank == 0:
+                pbar.close()
 
-            # End of epoch logging
+            # Step the learning rate scheduler
             lr_scheduler.step()
 
-            # Calculate epoch averages
-            epoch_avg_metrics = {
-                f"epoch_{k}": v / num_batches for k, v in epoch_metrics.items()
-            }
-            epoch_avg_metrics["epoch"] = epoch
-            epoch_avg_metrics["lr"] = optimizer.param_groups[0]["lr"]
+            # Synchronize before validation
+            if dist.is_initialized():
+                dist.barrier()
 
-            # Log epoch metrics
-            performance_metrics.update_epoch(
-                epoch_avg_metrics, epoch, log_to_console=True
-            )
+            # Only run evaluation on rank 0
+            if rank == 0:
+                logger.info(f"Running evaluation for epoch {epoch}")
+                eval_metrics = evaluate(model, val_loader, device, cfg)
 
-            logger.info(f"\nEpoch {epoch} Summary:")
-            for k, v in epoch_avg_metrics.items():
-                logger.info(f"  {k}: {(v/len(train_loader)):.4f}")
+                # Log evaluation metrics for this epoch
+                eval_epoch_metrics = {f"eval_{k}": v for k, v in eval_metrics.items()}
+                eval_epoch_metrics["epoch"] = epoch
+                performance_metrics.update(
+                    eval_epoch_metrics, epoch, log_to_console=True
+                )
 
-            # Evaluation phase
-            logger.info(f"Running evaluation for epoch {epoch}")
-            eval_metrics = evaluate(model, val_set, device, cfg)
-
-            # Log evaluation metrics for this epoch
-            eval_epoch_metrics = {f"eval_{k}": v for k, v in eval_metrics.items()}
-            eval_epoch_metrics["epoch"] = epoch
-            performance_metrics.update(eval_epoch_metrics, epoch, log_to_console=True)
-
-            # Save checkpoint after each epoch
-            torch.save(model.state_dict(), os.path.join(cfg["OUTPUT"]["DIR"], f"model_epoch_{epoch:03d}.pth"))
-            torch.save(optimizer.state_dict(), os.path.join(cfg["OUTPUT"]["DIR"], f"optimizer_epoch_{epoch:03d}.pth"))
+                # Save checkpoint after each epoch
+                torch.save(
+                    model.module.state_dict(),
+                    os.path.join(cfg["OUTPUT"]["DIR"], f"model_epoch_{epoch:03d}.pth"),
+                )
+                torch.save(
+                    optimizer.state_dict(),
+                    os.path.join(cfg["OUTPUT"]["DIR"], f"optimizer_epoch_{epoch:03d}.pth"),
+                )
 
     except Exception as e:
-        logger.error(f"Error during training: {str(e)}")
+        if rank == 0:
+            logger.error(f"Error during training: {str(e)}")
         raise e
     finally:
-        metrics_logger.close()
+        if rank == 0:
+            metrics_logger.close()
 
 
 def evaluate(model, dataset, device, cfg):
@@ -375,8 +380,103 @@ def evaluate(model, dataset, device, cfg):
         raise e
 
 
+def setup(rank, world_size, dist_url):
+    """Initialize distributed training"""
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+
+    dist.init_process_group(
+        backend="nccl", init_method=dist_url, world_size=world_size, rank=rank
+    )
+
+
+def cleanup():
+    """Cleanup distributed training"""
+    dist.destroy_process_group()
+
+
+def main_worker(rank, world_size, cfg):
+    setup(rank, world_size, "tcp://localhost:12355")
+
+    # Set device for this process
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+
+    # Setup datasets and dataloaders
+    transform = T.Compose(
+        [
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+
+    train_dataset = CustomCocoDetection(
+        root=cfg["DATA"]["TRAIN_ROOT"],
+        annFile=cfg["DATA"]["TRAIN_ANN"],
+        transform=transform,
+    )
+
+    val_dataset = CustomCocoDetection(
+        root=cfg["DATA"]["VAL_ROOT"],
+        annFile=cfg["DATA"]["VAL_ANN"],
+        transform=transform,
+    )
+
+    # Reduce training dataset to 10%
+    train_indices = list(range(len(train_dataset)))
+    random.shuffle(train_indices)
+    subset_size = int(0.1 * len(train_indices))
+    train_subset = Subset(train_dataset, train_indices[:subset_size])
+
+    # Create samplers for DDP
+    train_sampler = DistributedSampler(train_subset, shuffle=False)
+    val_sampler = DistributedSampler(val_dataset, shuffle=False)
+
+    train_loader = DataLoader(
+        train_subset,
+        batch_size=cfg["SOLVER"]["BATCH_SIZE"],
+        sampler=train_sampler,
+        num_workers=cfg["SYSTEM"]["NUM_WORKERS"],
+        collate_fn=collate_fn,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg["SOLVER"]["BATCH_SIZE"],
+        sampler=val_sampler,
+        num_workers=cfg["SYSTEM"]["NUM_WORKERS"],
+        collate_fn=collate_fn,
+        pin_memory=True,
+    )
+
+    # Create model
+    backbone = load_model_retina(cfg)
+    model = FasterRCNN(
+        backbone, num_classes=len(train_dataset.continuous_category_id_to_coco) + 1
+    )
+    model = model.to(device)
+
+    # Wrap model with DDP
+    model = DistributedDataParallel(
+        model, device_ids=[rank], find_unused_parameters=True
+    )
+
+    # Create optimizer and scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["SOLVER"]["BASE_LR"])
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
+
+    # Train and evaluate
+    try:
+        if rank == 0:
+            print(f"Starting training on {world_size} GPUs")
+        train(model, train_loader, val_loader, device, cfg, optimizer, lr_scheduler)
+    finally:
+        cleanup()
+
+
 if __name__ == "__main__":
-    # Configuration dictionary similar to train.py
+    # Updated configuration
     cfg = {
         "OUTPUT": {
             "DIR": os.path.join("output", datetime.now().strftime("%Y%m%d_%H%M%S")),
@@ -391,8 +491,18 @@ if __name__ == "__main__":
         "SOLVER": {
             "EPOCHS": 100,
             "BASE_LR": 0.001,
+            "BATCH_SIZE": 4,
         },
-        "SYSTEM": {"DEVICE": "cuda" if torch.cuda.is_available() else "cpu"},
+        "SYSTEM": {
+            "NUM_GPUS": torch.cuda.device_count(),
+            "NUM_WORKERS": 2,
+        },
+        "DATA": {
+            "TRAIN_ROOT": "/mnt/drive_test/coco/train2017",
+            "TRAIN_ANN": "/mnt/drive_test/coco/annotations/instances_train2017.json",
+            "VAL_ROOT": "/mnt/drive_test/coco/val2017",
+            "VAL_ANN": "/mnt/drive_test/coco/annotations/instances_val2017.json",
+        },
         "LOAD": {
             "PATH": "",
             "UNSUPERVISED": "",
@@ -403,79 +513,6 @@ if __name__ == "__main__":
     # Create output directory
     os.makedirs(cfg["OUTPUT"]["DIR"], exist_ok=True)
 
-    rank, world_size = setup_distributed()
-    is_distributed = world_size > 1
-
-    # Step 1: Setup COCO dataset
-    transform = T.Compose(
-        [
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
-
-    train_dataset = CustomCocoDetection(
-        root="/mnt/drive_test/coco/train2017",
-        annFile="/mnt/drive_test/coco/annotations/instances_train2017.json",
-        transform=transform,
-    )
-
-    val_dataset = CustomCocoDetection(
-        root="/mnt/drive_test/coco/val2017",
-        annFile="/mnt/drive_test/coco/annotations/instances_val2017.json",
-        transform=transform,
-    )
-
-    # The number of classes should be number of COCO categories + 1 (for background)
-    num_classes = len(train_dataset.continuous_category_id_to_coco) + 1
-
-    # Reduce training dataset to 10%
-    train_indices = list(range(len(train_dataset)))
-    random.shuffle(train_indices)
-    subset_size = int(0.1 * len(train_indices))
-
-    train_subset = Subset(train_dataset, train_indices[:subset_size])
-
-    # distibuted samplers
-    train_sampler = DistributedSampler(train_subset) if is_distributed else None
-    val_sampler = (
-        DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=4,
-        shuffle=True,
-        num_workers=2,
-        collate_fn=lambda x: tuple(zip(*x)),
-        sampler=train_sampler,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=2,
-        shuffle=False,
-        num_workers=4,
-        collate_fn=lambda x: tuple(zip(*x)),
-        sampler=val_sampler,
-    )
-
-    # Step 2: Load/Create Retinanet with FPN model
-    backbone = load_model_retina(cfg)
-
-    model = FasterRCNN(
-        backbone, num_classes=len(train_dataset.continuous_category_id_to_coco) + 1
-    )
-
-    if is_distributed:
-        print("Using DistributedDataParallel")
-        model = DistributedDataParallel(model, device_ids=[rank])
-    elif torch.cuda.device_count() > 1:
-        print("Using DataParallel")
-        model = DataParallel(model)
-
-    # Train the model with validation loader for per-epoch evaluation
-    try:
-        train(model, train_loader, val_loader, cfg)
-    finally:
-        if is_distributed:
-            dist.destroy_process_group()
+    # Launch DDP training
+    world_size = cfg["SYSTEM"]["NUM_GPUS"]
+    mp.spawn(main_worker, args=(world_size, cfg), nprocs=world_size, join=True)
