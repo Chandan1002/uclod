@@ -184,8 +184,16 @@ def setup_logger(output_dir, rank):
     return logging.getLogger("train")
 
 
-def train(model, train_loader, val_set, device, cfg):
+def train(model, train_loader, val_set, cfg):
     """Training function with metrics logging and per-epoch evaluation"""
+    # Step 3: Define the optimizer and learning rate scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
+
+    # Step 4: Training and evaluation
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    model.to(device)
+
     # Setup logging and metrics
     logger = setup_logger(cfg["OUTPUT"]["DIR"], rank=0)
     metrics_logger = MetricsLogger(cfg["OUTPUT"]["DIR"], distributed=False)
@@ -219,7 +227,6 @@ def train(model, train_loader, val_set, device, cfg):
                 loss_dict = model(images, targets)
                 losses = sum(loss for loss in loss_dict.values())
                 losses.backward()
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
                 optimizer.step()
 
                 # Update metrics
@@ -285,10 +292,8 @@ def train(model, train_loader, val_set, device, cfg):
             performance_metrics.update(eval_epoch_metrics, epoch, log_to_console=True)
 
             # Save checkpoint after each epoch
-            checkpoint_path = os.path.join(
-                cfg["OUTPUT"]["DIR"], f"model_epoch_{epoch:03d}.pth"
-            )
-            torch.save(model.state_dict(), checkpoint_path)
+            torch.save(model.state_dict(), os.path.join(cfg["OUTPUT"]["DIR"], f"model_epoch_{epoch:03d}.pth"))
+            torch.save(optimizer.state_dict(), os.path.join(cfg["OUTPUT"]["DIR"], f"optimizer_epoch_{epoch:03d}.pth"))
 
     except Exception as e:
         logger.error(f"Error during training: {str(e)}")
@@ -454,7 +459,7 @@ if __name__ == "__main__":
         sampler=val_sampler,
     )
 
-    # Step 2: Load pre-trained Faster R-CNN with FPN model
+    # Step 2: Load/Create Retinanet with FPN model
     backbone = load_model_retina(cfg)
 
     model = FasterRCNN(
@@ -462,21 +467,15 @@ if __name__ == "__main__":
     )
 
     if is_distributed:
+        print("Using DistributedDataParallel")
         model = DistributedDataParallel(model, device_ids=[rank])
     elif torch.cuda.device_count() > 1:
+        print("Using DataParallel")
         model = DataParallel(model)
-
-    # Step 3: Define the optimizer and learning rate scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
-
-    # Step 4: Training and evaluation
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    model.to(device)
 
     # Train the model with validation loader for per-epoch evaluation
     try:
-        train(model, train_loader, val_loader, device, cfg)
+        train(model, train_loader, val_loader, cfg)
     finally:
         if is_distributed:
             dist.destroy_process_group()
