@@ -6,6 +6,7 @@ from datetime import datetime
 import torch
 import torchvision
 import torchvision.transforms as T
+import yaml
 from pycocotools.cocoeval import COCOeval
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CocoDetection
@@ -14,103 +15,70 @@ from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 from tqdm import tqdm
 
 from metrics import MetricsLogger, PerformanceMetrics
-
-# class CustomCocoDetection(CocoDetection):
-#     def __getitem__(self, idx):
-#         img, target = super().__getitem__(idx)
-#
-#         # Extract bounding boxes and labels
-#         boxes = [obj["bbox"] for obj in target]
-#         labels = [obj["category_id"] for obj in target]
-#
-#         if len(boxes) == 0:  # Handle images with no objects
-#             boxes = torch.zeros((0, 4), dtype=torch.float32)
-#             labels = torch.zeros((0,), dtype=torch.int64)
-#         else:
-#             # Convert to tensors
-#             boxes = torch.tensor(boxes, dtype=torch.float32)
-#             labels = torch.tensor(labels, dtype=torch.int64)
-#
-#             # Convert [x, y, width, height] to [x_min, y_min, x_max, y_max]
-#             boxes[:, 2:] += boxes[:, :2]  # Convert width/height to max coords
-#
-#             # Filter out invalid boxes (width or height <= 0)
-#             valid_indices = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
-#             boxes = boxes[valid_indices]
-#             labels = labels[valid_indices]
-#
-#         target = {"boxes": boxes, "labels": labels, "image_id": torch.tensor([idx])}
-#         return img, target
+from model import UnsupervisedDetector
 
 
-# class CustomCocoDetection(CocoDetection):
-#     def __getitem__(self, idx):
-#         img, target = super().__getitem__(idx)
-        
-#         # Get the actual COCO image ID from the original annotation
-#         image_id = self.ids[idx]  # This gets the actual COCO image ID
-        
-#         # Extract bounding boxes and labels
-#         boxes = [obj["bbox"] for obj in target]
-#         labels = [obj["category_id"] for obj in target]
+def load_config(config_file):
+    """Load YAML configuration file"""
+    with open(config_file, "r") as f:
+        return yaml.safe_load(f)
 
-#         if len(boxes) == 0:  # Handle images with no objects
-#             boxes = torch.zeros((0, 4), dtype=torch.float32)
-#             labels = torch.zeros((0,), dtype=torch.int64)
-#         else:
-#             # Convert to tensors
-#             boxes = torch.tensor(boxes, dtype=torch.float32)
-#             labels = torch.tensor(labels, dtype=torch.int64)
 
-#             # Convert [x, y, width, height] to [x_min, y_min, x_max, y_max]
-#             boxes[:, 2:] += boxes[:, :2]  # Convert width/height to max coords
+def load_model_frcnn(cfg, frcnn):
+    if cfg["LOAD"]["PATH"] != "":
+        path = cfg["LOAD"]["PATH"]
+        if cfg["LOAD"]["SUPERVISED"] != "":
+            print("Loading supervised")
+            pretrained_weights = torch.load(path + "/" + cfg["LOAD"]["SUPERVISED"])
+            frcnn.load_state_dict(pretrained_weights, strict=False)
 
-#             # Filter out invalid boxes (width or height <= 0)
-#             valid_indices = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
-#             boxes = boxes[valid_indices]
-#             labels = labels[valid_indices]
+        elif cfg["LOAD"]["UNSUPERVISED"] != "":
+            print("Loading unsupervised")
+            backbone = UnsupervisedDetector(load_config(path + "/" + "config.yaml"))
+            pretrained_weights = torch.load(path + "/" + cfg["LOAD"]["UNSUPERVISED"])
+            backbone.load_state_dict(pretrained_weights, strict=False)
+            backbone = backbone.pipeline2.fpn
 
-#         target = {
-#             "boxes": boxes,
-#             "labels": labels,
-#             "image_id": torch.tensor([image_id])  # Use actual COCO image ID
-#         }
-#         return img, target
+            frcnn.backbone = backbone
+
+    return frcnn
+
+
 class CustomCocoDetection(CocoDetection):
     def __init__(self, root, annFile, transform=None):
         super().__init__(root, annFile, transform)
         # Create a mapping from COCO category IDs to continuous index range
         self.continuous_category_id_to_coco = {}
         self.coco_to_continuous_category_id = {}
-        
+
         # Get all valid category IDs from COCO
         cat_ids = self.coco.getCatIds()
-        
+
         # Load all categories and create mapping
         categories = self.coco.loadCats(cat_ids)
-        
+
         # Sort categories by ID to ensure consistent mapping
-        categories = sorted(categories, key=lambda x: x['id'])
-        
+        categories = sorted(categories, key=lambda x: x["id"])
+
         print("\nInitializing COCO category mapping:")
         for idx, cat in enumerate(categories):
             # Map to a zero-based index range (keeping 0 for background)
             continuous_id = idx + 1  # +1 because 0 is reserved for background
-            coco_id = cat['id']
-            
+            coco_id = cat["id"]
+
             self.coco_to_continuous_category_id[coco_id] = continuous_id
             self.continuous_category_id_to_coco[continuous_id] = coco_id
-            
+
             # print(f"COCO ID {coco_id} -> Continuous ID {continuous_id} ({cat['name']})")
-            
+
     def __getitem__(self, idx):
         img, target = super().__getitem__(idx)
         image_id = self.ids[idx]
-        
+
         # Extract bounding boxes and labels
         boxes = []
         labels = []
-        
+
         # print(f"\nProcessing image {image_id}:")
         for obj in target:
             category_id = obj["category_id"]
@@ -141,9 +109,10 @@ class CustomCocoDetection(CocoDetection):
         target = {
             "boxes": boxes,
             "labels": labels,
-            "image_id": torch.tensor([image_id])
+            "image_id": torch.tensor([image_id]),
         }
         return img, target
+
 
 def move_to_device(obj, device):
     """
@@ -219,7 +188,7 @@ def train(model, train_loader, val_set, device, cfg):
                 # optimizer.step()
                 # Training step
                 optimizer.zero_grad()
-                
+
                 # Debug prints
                 # for idx, target in enumerate(targets):
                 #     print(f"\nBatch item {idx}:")
@@ -227,12 +196,12 @@ def train(model, train_loader, val_set, device, cfg):
                 #     print(f"Boxes shape: {target['boxes'].shape}")
                 #     print(f"Labels shape: {target['labels'].shape}")
                 #     print(f"Image ID: {target['image_id']}")
-                #     
+                #
                 #     # Validate label values
                 #     if len(target['labels']) > 0:
                 #         print(f"Min label: {target['labels'].min()}")
                 #         print(f"Max label: {target['labels'].max()}")
-                #         
+                #
                 #     # Validate box coordinates
                 #     if len(target['boxes']) > 0:
                 #         print(f"Box coordinate ranges:")
@@ -240,7 +209,7 @@ def train(model, train_loader, val_set, device, cfg):
                 #         print(f"y_min: {target['boxes'][:, 1].min():.2f} to {target['boxes'][:, 1].max():.2f}")
                 #         print(f"x_max: {target['boxes'][:, 2].min():.2f} to {target['boxes'][:, 2].max():.2f}")
                 #         print(f"y_max: {target['boxes'][:, 3].min():.2f} to {target['boxes'][:, 3].max():.2f}")
-                
+
                 loss_dict = model(images, targets)
                 losses = sum(loss for loss in loss_dict.values())
                 losses.backward()
@@ -305,9 +274,7 @@ def train(model, train_loader, val_set, device, cfg):
             # Log evaluation metrics for this epoch
             eval_epoch_metrics = {f"eval_{k}": v for k, v in eval_metrics.items()}
             eval_epoch_metrics["epoch"] = epoch
-            performance_metrics.update(
-                eval_epoch_metrics, epoch, log_to_console=True
-            )
+            performance_metrics.update(eval_epoch_metrics, epoch, log_to_console=True)
 
             # Save checkpoint after each epoch
             checkpoint_path = os.path.join(
@@ -365,7 +332,6 @@ def evaluate(model, dataset, device, cfg):
             logger.info("Did not worked")
             return {}
 
-
         # COCO evaluation
         coco_gt = val_dataset.coco
         coco_dt = coco_gt.loadRes(all_predictions)
@@ -409,6 +375,11 @@ if __name__ == "__main__":
             "BASE_LR": 0.001,
         },
         "SYSTEM": {"DEVICE": "cuda" if torch.cuda.is_available() else "cpu"},
+        "LOAD": {
+            "PATH": "./output/20250111_145054",
+            "UNSUPERVISED": "model_epoch_000_iter_0000000.pth",
+            "SUPERVISED": "",
+        },
     }
 
     # Create output directory
@@ -458,8 +429,9 @@ if __name__ == "__main__":
         collate_fn=lambda x: tuple(zip(*x)),
     )
 
-    # Step 2: Load pre-trained Faster R-CNN with FPN model
+    # Step 2: Load/Create pre-trained Faster R-CNN with FPN model
     model = fasterrcnn_resnet50_fpn(pretrained=False)
+    model = load_model_frcnn(cfg, model)
 
     # Replace the classification head to match the number of COCO classes
     # num_classes = 80  # 80 classes + background + other special classes
@@ -469,10 +441,6 @@ if __name__ == "__main__":
             in_features, num_classes
         )
     )
-
-    # Load the pre-trained weights
-    # pretrained_weights = torch.load("/home/ecx/ml/Simple_implementation/output/20241231_142448/model_epoch_339_final.pth")
-    # model.load_state_dict(pretrained_weights, strict=False)
 
     # Step 3: Define the optimizer and learning rate scheduler
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0005)
