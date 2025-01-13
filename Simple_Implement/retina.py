@@ -17,6 +17,12 @@ from torchvision.datasets import CocoDetection
 from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 from tqdm import tqdm
+import sys
+
+# Insert the parent directory of 'downstream' so that model.py becomes visible
+parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
 
 from metrics import MetricsLogger, PerformanceMetrics
 from model import UnsupervisedDetector
@@ -189,11 +195,12 @@ def setup_logger(output_dir, rank):
     return logging.getLogger("train")
 
 
-def train(model, train_loader, val_loader, device, cfg, optimizer, lr_scheduler):
+def train(model, train_loader, val_loader, val_dataset, device, cfg, optimizer, lr_scheduler):
     """Training function with metrics logging and per-epoch evaluation"""
     # Setup logging and metrics (only on rank 0)
     rank = dist.get_rank() if dist.is_initialized() else 0
     logger = setup_logger(cfg["OUTPUT"]["DIR"], rank=rank)
+    logger.info("Retina Code: 100 percent data")
 
     if rank == 0:
         metrics_logger = MetricsLogger(cfg["OUTPUT"]["DIR"], distributed=True)
@@ -253,7 +260,7 @@ def train(model, train_loader, val_loader, device, cfg, optimizer, lr_scheduler)
                         **{k: v.item() for k, v in loss_dict.items()},
                     }
 
-                    if global_iter != 0:
+                    if rank == 0 and global_iter != 0:
                         performance_metrics.update(
                             metrics, global_iter, lr, log_to_console=True
                         )
@@ -264,7 +271,9 @@ def train(model, train_loader, val_loader, device, cfg, optimizer, lr_scheduler)
                         f"Loss: {losses.item():.4f}, LR: {lr:.6f}"
                     )
 
-                pbar.update(1)
+                # Update progress bar only for rank 0
+                if rank == 0:
+                    pbar.update(1)
 
             if rank == 0:
                 pbar.close()
@@ -279,7 +288,7 @@ def train(model, train_loader, val_loader, device, cfg, optimizer, lr_scheduler)
             # Only run evaluation on rank 0
             if rank == 0:
                 logger.info(f"Running evaluation for epoch {epoch}")
-                eval_metrics = evaluate(model, val_loader, device, cfg)
+                eval_metrics = evaluate(model, val_dataset, device, cfg)
 
                 # Log evaluation metrics for this epoch
                 eval_epoch_metrics = {f"eval_{k}": v for k, v in eval_metrics.items()}
@@ -307,16 +316,96 @@ def train(model, train_loader, val_loader, device, cfg, optimizer, lr_scheduler)
             metrics_logger.close()
 
 
+# def evaluate(model, dataset, device, cfg):
+#     """Evaluation function with metrics logging"""
+#     logger = setup_logger(cfg["OUTPUT"]["DIR"], rank=0)
+
+#     model.eval()
+#     all_predictions = []
+#     try:
+#         with torch.no_grad():
+#             for images, targets in tqdm(dataset, desc="Evaluating"):
+#                 images = [img.to(device) for img in images]
+#                 targets = move_to_device(targets, device)
+#                 outputs = model(images)
+#                 for i, output in enumerate(outputs):
+#                     image_id = targets[i]["image_id"].item()
+#                     for box, label, score in zip(
+#                         output["boxes"].cpu().numpy(),
+#                         output["labels"].cpu().numpy(),
+#                         output["scores"].cpu().numpy(),
+#                     ):
+#                         prediction = {
+#                             "image_id": image_id,
+#                             "category_id": int(label),
+#                             "bbox": [
+#                                 float(box[0]),
+#                                 float(box[1]),
+#                                 float(box[2] - box[0]),
+#                                 float(box[3] - box[1]),
+#                             ],
+#                             "score": float(score),
+#                         }
+#                         all_predictions.append(prediction)
+
+#         if len(set([p["image_id"] for p in all_predictions])) == 0:
+#             logger.info("Did not worked")
+
+#         print("Prediction image_ids:", set([p["image_id"] for p in all_predictions]))
+#         print("Ground truth image_ids:", set(dataset.coco.getImgIds()))
+
+#         if len(set([p["image_id"] for p in all_predictions])) == 0:
+#             logger.info("Did not worked")
+#             return {}
+
+#         # COCO evaluation
+#         coco_gt = dataset.coco
+#         coco_dt = coco_gt.loadRes(all_predictions)
+#         coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
+#         coco_eval.evaluate()
+#         coco_eval.accumulate()
+#         coco_eval.summarize()
+
+#         # Log COCO metrics
+#         eval_metrics = {
+#             "AP": coco_eval.stats[0],  # AP at IoU=0.50:0.95
+#             "AP50": coco_eval.stats[1],  # AP at IoU=0.50
+#             "AP75": coco_eval.stats[2],  # AP at IoU=0.75
+#             "AP_small": coco_eval.stats[3],  # AP for small objects
+#             "AP_medium": coco_eval.stats[4],  # AP for medium objects
+#             "AP_large": coco_eval.stats[5],  # AP for large objects
+#         }
+
+#         # Log evaluation metrics
+#         # metrics_logger.update(eval_metrics, 0)
+#         logger.info("Evaluation Results:")
+#         for k, v in eval_metrics.items():
+#             logger.info(f"  {k}: {v:.4f}")
+
+#         return eval_metrics
+
+#     except Exception as e:
+#         logger.error(f"Error during evaluation: {str(e)}")
+#         raise e
 def evaluate(model, dataset, device, cfg):
     """Evaluation function with metrics logging"""
     logger = setup_logger(cfg["OUTPUT"]["DIR"], rank=0)
+    
+    # Create a DataLoader for evaluation
+    eval_loader = DataLoader(
+        dataset,
+        batch_size=cfg["SOLVER"]["BATCH_SIZE"],
+        shuffle=False,
+        num_workers=cfg["SYSTEM"]["NUM_WORKERS"],
+        collate_fn=collate_fn  # Make sure to use the same collate_fn as training
+    )
 
     model.eval()
     all_predictions = []
     try:
         with torch.no_grad():
-            for images, targets in tqdm(dataset, desc="Evaluating"):
-                images = [img.to(device) for img in images]
+            for images, targets in tqdm(eval_loader, desc="Evaluating"):
+                images = [image.to(device) for image in images]
                 targets = move_to_device(targets, device)
                 outputs = model(images)
                 for i, output in enumerate(outputs):
@@ -340,17 +429,14 @@ def evaluate(model, dataset, device, cfg):
                         all_predictions.append(prediction)
 
         if len(set([p["image_id"] for p in all_predictions])) == 0:
-            logger.info("Did not worked")
-
-        print("Prediction image_ids:", set([p["image_id"] for p in all_predictions]))
-        print("Ground truth image_ids:", set(val_dataset.coco.getImgIds()))
-
-        if len(set([p["image_id"] for p in all_predictions])) == 0:
-            logger.info("Did not worked")
+            logger.info("No predictions were made")
             return {}
 
+        print("Prediction image_ids:", set([p["image_id"] for p in all_predictions]))
+        print("Ground truth image_ids:", set(dataset.coco.getImgIds()))
+
         # COCO evaluation
-        coco_gt = val_dataset.coco
+        coco_gt = dataset.coco
         coco_dt = coco_gt.loadRes(all_predictions)
         coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
         coco_eval.evaluate()
@@ -367,8 +453,6 @@ def evaluate(model, dataset, device, cfg):
             "AP_large": coco_eval.stats[5],  # AP for large objects
         }
 
-        # Log evaluation metrics
-        # metrics_logger.update(eval_metrics, 0)
         logger.info("Evaluation Results:")
         for k, v in eval_metrics.items():
             logger.info(f"  {k}: {v:.4f}")
@@ -378,7 +462,6 @@ def evaluate(model, dataset, device, cfg):
     except Exception as e:
         logger.error(f"Error during evaluation: {str(e)}")
         raise e
-
 
 def setup(rank, world_size, dist_url):
     """Initialize distributed training"""
@@ -425,7 +508,7 @@ def main_worker(rank, world_size, cfg):
     # Reduce training dataset to 10%
     train_indices = list(range(len(train_dataset)))
     random.shuffle(train_indices)
-    subset_size = int(0.1 * len(train_indices))
+    subset_size = int(1 * len(train_indices))
     train_subset = Subset(train_dataset, train_indices[:subset_size])
 
     # Create samplers for DDP
@@ -470,7 +553,7 @@ def main_worker(rank, world_size, cfg):
     try:
         if rank == 0:
             print(f"Starting training on {world_size} GPUs")
-        train(model, train_loader, val_loader, device, cfg, optimizer, lr_scheduler)
+        train(model, train_loader, val_loader, val_dataset, device, cfg, optimizer, lr_scheduler)
     finally:
         cleanup()
 
