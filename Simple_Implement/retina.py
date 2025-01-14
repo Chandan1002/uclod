@@ -51,18 +51,13 @@ def load_config(config_file):
         return yaml.safe_load(f)
 
 
-def load_model_retina(cfg):
+def load_model_retina(cfg, retina):
     if cfg["LOAD"]["PATH"] != "":
         path = cfg["LOAD"]["PATH"]
         if cfg["LOAD"]["SUPERVISED"] != "":
             print("Loading supervised")
-            backbone = resnet_fpn_backbone(
-                backbone_name=cfg["MODEL"]["BACKBONE"]["NAME"],
-                pretrained=False,
-                trainable_layers=5,
-            )
             pretrained_weights = torch.load(path + "/" + cfg["LOAD"]["SUPERVISED"])
-            backbone.load_state_dict(pretrained_weights, strict=False)
+            retina.load_state_dict(pretrained_weights, strict=False)
 
         elif cfg["LOAD"]["UNSUPERVISED"] != "":
             print("Loading unsupervised")
@@ -70,15 +65,10 @@ def load_model_retina(cfg):
             pretrained_weights = torch.load(path + "/" + cfg["LOAD"]["UNSUPERVISED"])
             backbone.load_state_dict(pretrained_weights, strict=False)
             backbone = backbone.pipeline2.fpn
-    else:
-        print("Using raw model")
-        backbone = resnet_fpn_backbone(
-            backbone_name=cfg["MODEL"]["BACKBONE"]["NAME"],
-            pretrained=False,
-            trainable_layers=5,
-        )
 
-    return backbone
+            retina.backbone = backbone
+
+    return retina
 
 
 class CustomCocoDetection(CocoDetection):
@@ -537,9 +527,9 @@ if __name__ == "__main__":
             "VAL_ANN": "/mnt/drive_test/coco/annotations/instances_val2017.json",
         },
         "LOAD": {
-            "PATH": "./output/20250113_093928/",
+            "PATH": "",
             "UNSUPERVISED": "",
-            "SUPERVISED": "model_epoch_003.pth",
+            "SUPERVISED": "",
         },
     }
 
