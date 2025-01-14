@@ -188,7 +188,7 @@ def setup_logger(output_dir, rank):
 
 
 def train(
-    model, train_loader, val_loader, val_dataset, device, cfg, optimizer, lr_scheduler
+    model, train_loader, val_dataset, device, cfg, optimizer, lr_scheduler
 ):
     """Training function with metrics logging and per-epoch evaluation"""
     # Setup logging and metrics (only on rank 0)
@@ -230,7 +230,7 @@ def train(
                 loss_dict = model(images, targets)
                 losses = sum(loss for loss in loss_dict.values())
                 losses.backward()
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
                 optimizer.step()
 
                 # Update metrics
@@ -458,17 +458,12 @@ def main_worker(rank, world_size, cfg):
         pin_memory=True,
     )
 
-    # Create model
-    # backbone = load_model_retina(cfg)
-    # model = FasterRCNN(
-    #     backbone, num_classes=len(train_dataset.continuous_category_id_to_coco) + 1
-    # )
-
     # Create RetinaNet model
     model = retinanet_resnet50_fpn(
         num_classes=len(train_dataset.continuous_category_id_to_coco) + 1,
         pretrained_backbone=False
     )
+    model = load_model_retina(cfg, model)
     model = model.to(device)
 
     # Wrap model with DDP
@@ -477,7 +472,14 @@ def main_worker(rank, world_size, cfg):
     )
 
     # Create optimizer and scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["SOLVER"]["BASE_LR"])
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["SOLVER"]["BASE_LR"])
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=cfg["SOLVER"]["BASE_LR"],
+        momentum=0.9,
+        weight_decay=0.0001
+    )
+
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
 
     # Train and evaluate
@@ -487,7 +489,6 @@ def main_worker(rank, world_size, cfg):
         train(
             model,
             train_loader,
-            val_loader,
             val_dataset,
             device,
             cfg,
@@ -513,7 +514,7 @@ if __name__ == "__main__":
         },
         "SOLVER": {
             "EPOCHS": 100,
-            "BASE_LR": 0.001,
+            "BASE_LR": 0.01,
             "BATCH_SIZE": 4,
         },
         "SYSTEM": {
