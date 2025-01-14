@@ -433,7 +433,7 @@ def main_worker(rank, world_size, cfg):
     # Reduce training dataset to 10%
     train_indices = list(range(len(train_dataset)))
     random.shuffle(train_indices)
-    subset_size = int(0.01 * len(train_indices))
+    subset_size = int(1 * len(train_indices))
     train_subset = Subset(train_dataset, train_indices[:subset_size])
 
     # Create samplers for DDP
@@ -449,14 +449,14 @@ def main_worker(rank, world_size, cfg):
         pin_memory=True,
     )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=cfg["SOLVER"]["BATCH_SIZE"],
-        sampler=val_sampler,
-        num_workers=cfg["SYSTEM"]["NUM_WORKERS"],
-        collate_fn=collate_fn,
-        pin_memory=True,
-    )
+    # val_loader = DataLoader(
+    #     val_dataset,
+    #     batch_size=cfg["SOLVER"]["BATCH_SIZE"],
+    #     sampler=val_sampler,
+    #     num_workers=cfg["SYSTEM"]["NUM_WORKERS"],
+    #     collate_fn=collate_fn,
+    #     pin_memory=True,
+    # )
 
     # Create RetinaNet model
     model = retinanet_resnet50_fpn(
