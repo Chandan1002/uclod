@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import sys
 from datetime import datetime
 
 import torch
@@ -16,11 +17,12 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import CocoDetection
 from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
+from torchvision.models.detection import retinanet_resnet50_fpn
+
 from tqdm import tqdm
-import sys
 
 # Insert the parent directory of 'downstream' so that model.py becomes visible
-parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
@@ -113,27 +115,27 @@ class CustomCocoDetection(CocoDetection):
         labels = []
 
         # Use list comprehension for faster processing
-        boxes, labels = (
-            zip(
-                *[
-                    (
-                        obj["bbox"],
-                        self.coco_to_continuous_category_id[obj["category_id"]],
-                    )
-                    for obj in target
-                    if obj["category_id"] in self.coco_to_continuous_category_id
-                ]
-            )
-            if target
-            else ([], [])
-        )
+        # boxes, labels = (
+        #     zip(
+        #         *[
+        #             (
+        #                 obj["bbox"],
+        #                 self.coco_to_continuous_category_id[obj["category_id"]],
+        #             )
+        #             for obj in target
+        #             if obj["category_id"] in self.coco_to_continuous_category_id
+        #         ]
+        #     )
+        #     if target
+        #     else ([], [])
+        # )
 
-        # for obj in target:
-        #     category_id = obj["category_id"]
-        #     if category_id in self.coco_to_continuous_category_id:
-        #         boxes.append(obj["bbox"])
-        #         continuous_id = self.coco_to_continuous_category_id[category_id]
-        #         labels.append(continuous_id)
+        for obj in target:
+            category_id = obj["category_id"]
+            if category_id in self.coco_to_continuous_category_id:
+                boxes.append(obj["bbox"])
+                continuous_id = self.coco_to_continuous_category_id[category_id]
+                labels.append(continuous_id)
 
         if len(boxes) == 0:  # Handle images with no objects
             boxes = torch.zeros((0, 4), dtype=torch.float32)
@@ -195,7 +197,9 @@ def setup_logger(output_dir, rank):
     return logging.getLogger("train")
 
 
-def train(model, train_loader, val_loader, val_dataset, device, cfg, optimizer, lr_scheduler):
+def train(
+    model, train_loader, val_loader, val_dataset, device, cfg, optimizer, lr_scheduler
+):
     """Training function with metrics logging and per-epoch evaluation"""
     # Setup logging and metrics (only on rank 0)
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -218,10 +222,8 @@ def train(model, train_loader, val_loader, val_dataset, device, cfg, optimizer, 
             model.train()
             epoch_metrics = {
                 "loss": 0.0,
-                "loss_classifier": 0.0,
-                "loss_box_reg": 0.0,
-                "loss_objectness": 0.0,
-                "loss_rpn_box_reg": 0.0,
+                "loss_classification": 0.0,
+                "loss_bbox_regression": 0.0,
             }
             num_batches = 0
 
@@ -247,7 +249,8 @@ def train(model, train_loader, val_loader, val_dataset, device, cfg, optimizer, 
                 # Accumulate losses for epoch metrics
                 epoch_metrics["loss"] += losses.item()
                 for k, v in loss_dict.items():
-                    epoch_metrics[k] += v.item()
+                    if k in epoch_metrics:
+                        epoch_metrics[f"loss_{k}"] += v.item()
                 num_batches += 1
 
                 # Log metrics periodically
@@ -304,7 +307,9 @@ def train(model, train_loader, val_loader, val_dataset, device, cfg, optimizer, 
                 )
                 torch.save(
                     optimizer.state_dict(),
-                    os.path.join(cfg["OUTPUT"]["DIR"], f"optimizer_epoch_{epoch:03d}.pth"),
+                    os.path.join(
+                        cfg["OUTPUT"]["DIR"], f"optimizer_epoch_{epoch:03d}.pth"
+                    ),
                 )
 
     except Exception as e:
@@ -316,88 +321,17 @@ def train(model, train_loader, val_loader, val_dataset, device, cfg, optimizer, 
             metrics_logger.close()
 
 
-# def evaluate(model, dataset, device, cfg):
-#     """Evaluation function with metrics logging"""
-#     logger = setup_logger(cfg["OUTPUT"]["DIR"], rank=0)
-
-#     model.eval()
-#     all_predictions = []
-#     try:
-#         with torch.no_grad():
-#             for images, targets in tqdm(dataset, desc="Evaluating"):
-#                 images = [img.to(device) for img in images]
-#                 targets = move_to_device(targets, device)
-#                 outputs = model(images)
-#                 for i, output in enumerate(outputs):
-#                     image_id = targets[i]["image_id"].item()
-#                     for box, label, score in zip(
-#                         output["boxes"].cpu().numpy(),
-#                         output["labels"].cpu().numpy(),
-#                         output["scores"].cpu().numpy(),
-#                     ):
-#                         prediction = {
-#                             "image_id": image_id,
-#                             "category_id": int(label),
-#                             "bbox": [
-#                                 float(box[0]),
-#                                 float(box[1]),
-#                                 float(box[2] - box[0]),
-#                                 float(box[3] - box[1]),
-#                             ],
-#                             "score": float(score),
-#                         }
-#                         all_predictions.append(prediction)
-
-#         if len(set([p["image_id"] for p in all_predictions])) == 0:
-#             logger.info("Did not worked")
-
-#         print("Prediction image_ids:", set([p["image_id"] for p in all_predictions]))
-#         print("Ground truth image_ids:", set(dataset.coco.getImgIds()))
-
-#         if len(set([p["image_id"] for p in all_predictions])) == 0:
-#             logger.info("Did not worked")
-#             return {}
-
-#         # COCO evaluation
-#         coco_gt = dataset.coco
-#         coco_dt = coco_gt.loadRes(all_predictions)
-#         coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
-#         coco_eval.evaluate()
-#         coco_eval.accumulate()
-#         coco_eval.summarize()
-
-#         # Log COCO metrics
-#         eval_metrics = {
-#             "AP": coco_eval.stats[0],  # AP at IoU=0.50:0.95
-#             "AP50": coco_eval.stats[1],  # AP at IoU=0.50
-#             "AP75": coco_eval.stats[2],  # AP at IoU=0.75
-#             "AP_small": coco_eval.stats[3],  # AP for small objects
-#             "AP_medium": coco_eval.stats[4],  # AP for medium objects
-#             "AP_large": coco_eval.stats[5],  # AP for large objects
-#         }
-
-#         # Log evaluation metrics
-#         # metrics_logger.update(eval_metrics, 0)
-#         logger.info("Evaluation Results:")
-#         for k, v in eval_metrics.items():
-#             logger.info(f"  {k}: {v:.4f}")
-
-#         return eval_metrics
-
-#     except Exception as e:
-#         logger.error(f"Error during evaluation: {str(e)}")
-#         raise e
 def evaluate(model, dataset, device, cfg):
     """Evaluation function with metrics logging"""
     logger = setup_logger(cfg["OUTPUT"]["DIR"], rank=0)
-    
+
     # Create a DataLoader for evaluation
     eval_loader = DataLoader(
         dataset,
         batch_size=cfg["SOLVER"]["BATCH_SIZE"],
         shuffle=False,
         num_workers=cfg["SYSTEM"]["NUM_WORKERS"],
-        collate_fn=collate_fn  # Make sure to use the same collate_fn as training
+        collate_fn=collate_fn,  # Make sure to use the same collate_fn as training
     )
 
     model.eval()
@@ -463,6 +397,7 @@ def evaluate(model, dataset, device, cfg):
         logger.error(f"Error during evaluation: {str(e)}")
         raise e
 
+
 def setup(rank, world_size, dist_url):
     """Initialize distributed training"""
     os.environ["MASTER_ADDR"] = "localhost"
@@ -508,7 +443,7 @@ def main_worker(rank, world_size, cfg):
     # Reduce training dataset to 10%
     train_indices = list(range(len(train_dataset)))
     random.shuffle(train_indices)
-    subset_size = int(1 * len(train_indices))
+    subset_size = int(0.01 * len(train_indices))
     train_subset = Subset(train_dataset, train_indices[:subset_size])
 
     # Create samplers for DDP
@@ -534,15 +469,21 @@ def main_worker(rank, world_size, cfg):
     )
 
     # Create model
-    backbone = load_model_retina(cfg)
-    model = FasterRCNN(
-        backbone, num_classes=len(train_dataset.continuous_category_id_to_coco) + 1
+    # backbone = load_model_retina(cfg)
+    # model = FasterRCNN(
+    #     backbone, num_classes=len(train_dataset.continuous_category_id_to_coco) + 1
+    # )
+
+    # Create RetinaNet model
+    model = retinanet_resnet50_fpn(
+        num_classes=len(train_dataset.continuous_category_id_to_coco) + 1,
+        pretrained_backbone=False
     )
     model = model.to(device)
 
     # Wrap model with DDP
     model = DistributedDataParallel(
-        model, device_ids=[rank], find_unused_parameters=True
+        model, device_ids=[rank], find_unused_parameters=False
     )
 
     # Create optimizer and scheduler
@@ -553,7 +494,16 @@ def main_worker(rank, world_size, cfg):
     try:
         if rank == 0:
             print(f"Starting training on {world_size} GPUs")
-        train(model, train_loader, val_loader, val_dataset, device, cfg, optimizer, lr_scheduler)
+        train(
+            model,
+            train_loader,
+            val_loader,
+            val_dataset,
+            device,
+            cfg,
+            optimizer,
+            lr_scheduler,
+        )
     finally:
         cleanup()
 
@@ -587,9 +537,9 @@ if __name__ == "__main__":
             "VAL_ANN": "/mnt/drive_test/coco/annotations/instances_val2017.json",
         },
         "LOAD": {
-            "PATH": "",
+            "PATH": "./output/20250113_093928/",
             "UNSUPERVISED": "",
-            "SUPERVISED": "",
+            "SUPERVISED": "model_epoch_003.pth",
         },
     }
 
