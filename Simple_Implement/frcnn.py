@@ -229,7 +229,7 @@ def train(
                 loss_dict = model(images, targets)
                 losses = sum(loss for loss in loss_dict.values())
                 losses.backward()
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
                 optimizer.step()
 
                 # Update metrics
@@ -431,7 +431,7 @@ def main_worker(rank, world_size, cfg):
     # Reduce training dataset to 10%
     train_indices = list(range(len(train_dataset)))
     random.shuffle(train_indices)
-    subset_size = int(1 * len(train_indices))
+    subset_size = int(0.01 * len(train_indices))
     train_subset = Subset(train_dataset, train_indices[:subset_size])
 
     # Create samplers for DDP
@@ -478,7 +478,12 @@ def main_worker(rank, world_size, cfg):
     )
 
     # Create optimizer and scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["SOLVER"]["BASE_LR"])
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=cfg["SOLVER"]["BASE_LR"],
+        momentum=0.9,
+        weight_decay=0.0001,
+    )
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
 
     # Train and evaluate
